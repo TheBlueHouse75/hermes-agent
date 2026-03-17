@@ -1023,7 +1023,7 @@ class TestRunConversation:
 
     def test_rate_limit_error_switches_to_fallback_and_retries(self, agent):
         self._setup_agent(agent)
-        agent._fallback_model = {"provider": "ollama", "model": "llama3.2:latest"}
+        agent._fallback_model = {"provider": "ollama", "model": "qwen3.5:9b"}
 
         class RateLimitError(RuntimeError):
             status_code = 429

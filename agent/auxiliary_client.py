@@ -910,7 +910,7 @@ def resolve_provider_client(
                 return None, None
 
             base_url = pconfig.inference_base_url
-            default_model = "llama3.2:latest"
+            default_model = "qwen3.5:9b"
             final_model = model or default_model
 
             # Ollama uses OpenAI-compatible API but without auth

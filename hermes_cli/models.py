@@ -147,11 +147,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "google/gemini-3-flash-preview",
     ],
     "ollama": [
-        "llama3.2:latest",
+        "qwen3.5:9b",
         "llama3.1:8b",
         "mistral:latest",
         "qwen2.5:latest",
         "deepseek-r1:14b",
+        "llama3.2:latest",
     ],
     "alibaba": [
         "qwen3.5-plus",

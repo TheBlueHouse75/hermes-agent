@@ -148,7 +148,7 @@ class TestTryActivateFallback:
 
     def test_activates_ollama_fallback(self):
         agent = _make_agent(
-            fallback_model={"provider": "ollama", "model": "llama3.2:latest"},
+            fallback_model={"provider": "ollama", "model": "qwen3.5:9b"},
         )
         mock_client = _mock_resolve(
             api_key="***",
@@ -156,10 +156,10 @@ class TestTryActivateFallback:
         )
         with patch(
             "agent.auxiliary_client.resolve_provider_client",
-            return_value=(mock_client, "llama3.2:latest"),
+            return_value=(mock_client, "qwen3.5:9b"),
         ):
             assert agent._try_activate_fallback() is True
-            assert agent.model == "llama3.2:latest"
+            assert agent.model == "qwen3.5:9b"
             assert agent.provider == "ollama"
             assert agent.api_mode == "chat_completions"
             assert agent.client is mock_client
