@@ -896,6 +896,29 @@ def resolve_provider_client(
         return None, None
 
     if pconfig.auth_type == "api_key":
+        # Special case: Ollama doesn't need an API key
+        if provider == "ollama":
+            import socket
+            # Check if Ollama is running
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("localhost", 11434))
+                sock.close()
+            except (socket.error, socket.timeout):
+                logger.warning("resolve_provider_client: ollama requested but Ollama is not running on localhost:11434")
+                return None, None
+
+            base_url = pconfig.inference_base_url
+            default_model = "llama3.2:latest"
+            final_model = model or default_model
+
+            # Ollama uses OpenAI-compatible API but without auth
+            client = OpenAI(api_key="***", base_url=base_url)
+
+            return (_to_async_client(client, final_model) if async_mode
+                    else (client, final_model))
+
         if provider == "anthropic":
             client, default_model = _try_anthropic()
             if client is None:

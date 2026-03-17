@@ -1005,6 +1005,47 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_successful_primary_path_does_not_activate_fallback(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Primary answer", finish_reason="stop")
+        with (
+            patch.object(agent, "_interruptible_api_call", return_value=resp),
+            patch.object(agent, "_try_activate_fallback", return_value=False) as mock_fallback,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Primary answer"
+        assert result["completed"] is True
+        mock_fallback.assert_not_called()
+
+    def test_rate_limit_error_switches_to_fallback_and_retries(self, agent):
+        self._setup_agent(agent)
+        agent._fallback_model = {"provider": "ollama", "model": "llama3.2:latest"}
+
+        class RateLimitError(RuntimeError):
+            status_code = 429
+
+        resp = _mock_response(content="Fallback answer", finish_reason="stop")
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=[RateLimitError("rate limited"), resp],
+            ),
+            patch.object(agent, "_try_activate_fallback", return_value=True) as mock_fallback,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Fallback answer"
+        assert result["completed"] is True
+        assert mock_fallback.call_count == 1
+
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

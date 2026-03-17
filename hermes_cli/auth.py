@@ -192,8 +192,16 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Kilo Code",
         auth_type="api_key",
         inference_base_url="https://api.kilo.ai/api/gateway",
-        api_key_env_vars=("KILOCODE_API_KEY",),
+        api_key_env_vars=("KILO...EY",),
         base_url_env_var="KILOCODE_BASE_URL",
+    ),
+    "ollama": ProviderConfig(
+        id="ollama",
+        name="Ollama (Local)",
+        auth_type="api_key",
+        inference_base_url="http://localhost:11434/v1",
+        api_key_env_vars=(),  # No API key needed for local
+        base_url_env_var="",
     ),
 }
 

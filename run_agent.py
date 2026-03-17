@@ -5616,10 +5616,10 @@ class AIAgent:
                     # compress history and retry, not abort immediately.
                     status_code = getattr(api_error, "status_code", None)
 
-                    # Eager fallback for rate-limit errors (429 or quota exhaustion).
+                    # Eager fallback for quota/rate-limit/server-side provider failures.
                     # When a fallback model is configured, switch immediately instead
                     # of burning through retries with exponential backoff -- the
-                    # primary provider won't recover within the retry window.
+                    # primary provider usually will not recover within the retry window.
                     is_rate_limited = (
                         status_code == 429
                         or "rate limit" in error_msg
@@ -5628,7 +5628,16 @@ class AIAgent:
                         or "usage limit" in error_msg
                         or "quota" in error_msg
                     )
-                    if is_rate_limited and not self._fallback_activated:
+                    is_server_failure = (
+                        status_code in {500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+                        or "internal server error" in error_msg
+                        or "server error" in error_msg
+                        or "service unavailable" in error_msg
+                        or "bad gateway" in error_msg
+                        or "gateway timeout" in error_msg
+                        or "overloaded" in error_msg
+                    )
+                    if (is_rate_limited or is_server_failure) and not self._fallback_activated:
                         if self._try_activate_fallback():
                             retry_count = 0
                             continue

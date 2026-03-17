@@ -134,7 +134,7 @@ class TestTryActivateFallback:
             fallback_model={"provider": "minimax", "model": "MiniMax-M2.5"},
         )
         mock_client = _mock_resolve(
-            api_key="sk-mm-key",
+            api_key="***",
             base_url="https://api.minimax.io/v1",
         )
         with patch(
@@ -144,6 +144,24 @@ class TestTryActivateFallback:
             assert agent._try_activate_fallback() is True
             assert agent.model == "MiniMax-M2.5"
             assert agent.provider == "minimax"
+            assert agent.client is mock_client
+
+    def test_activates_ollama_fallback(self):
+        agent = _make_agent(
+            fallback_model={"provider": "ollama", "model": "llama3.2:latest"},
+        )
+        mock_client = _mock_resolve(
+            api_key="***",
+            base_url="http://localhost:11434/v1",
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "llama3.2:latest"),
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.model == "llama3.2:latest"
+            assert agent.provider == "ollama"
+            assert agent.api_mode == "chat_completions"
             assert agent.client is mock_client
 
     def test_only_fires_once(self):

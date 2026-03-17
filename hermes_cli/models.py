@@ -146,6 +146,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "google/gemini-3-pro-preview",
         "google/gemini-3-flash-preview",
     ],
+    "ollama": [
+        "llama3.2:latest",
+        "llama3.1:8b",
+        "mistral:latest",
+        "qwen2.5:latest",
+        "deepseek-r1:14b",
+    ],
     "alibaba": [
         "qwen3.5-plus",
         "qwen3-max",
@@ -171,6 +178,7 @@ _PROVIDER_LABELS = {
     "opencode-go": "OpenCode Go",
     "ai-gateway": "AI Gateway",
     "kilocode": "Kilo Code",
+    "ollama": "Ollama (Local)",
     "alibaba": "Alibaba Cloud (DashScope)",
     "custom": "Custom endpoint",
 }
@@ -201,6 +209,7 @@ _PROVIDER_ALIASES = {
     "aliyun": "alibaba",
     "qwen": "alibaba",
     "alibaba-cloud": "alibaba",
+    "local": "ollama",
 }
 
 
