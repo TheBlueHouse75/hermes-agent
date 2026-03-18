@@ -629,6 +629,9 @@ class AIAgent:
         # Config shape: {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
         self._fallback_model = fallback_model if isinstance(fallback_model, dict) else None
         self._fallback_activated = False
+        self._fallback_activated_at = None
+        self._primary_state = None  # saved primary provider state for re-probe
+        self._fallback_reprobe_interval = 1800  # 30 minutes
         if self._fallback_model:
             fb_p = self._fallback_model.get("provider", "")
             fb_m = self._fallback_model.get("model", "")
@@ -3333,12 +3336,28 @@ class AIAgent:
                 fb_api_mode = "anthropic_messages"
             fb_base_url = str(fb_client.base_url)
 
+            # Save primary state for re-probe
+            self._primary_state = {
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "api_mode": self.api_mode,
+                "client": self.client,
+                "client_kwargs": getattr(self, "_client_kwargs", {}),
+                "use_prompt_caching": self._use_prompt_caching,
+                "_anthropic_client": getattr(self, "_anthropic_client", None),
+                "_anthropic_api_key": getattr(self, "_anthropic_api_key", None),
+                "_anthropic_base_url": getattr(self, "_anthropic_base_url", None),
+                "_is_anthropic_oauth": getattr(self, "_is_anthropic_oauth", False),
+            }
+
             old_model = self.model
             self.model = fb_model
             self.provider = fb_provider
             self.base_url = fb_base_url
             self.api_mode = fb_api_mode
             self._fallback_activated = True
+            self._fallback_activated_at = time.time()
 
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
@@ -3375,6 +3394,76 @@ class AIAgent:
             return True
         except Exception as e:
             logging.error("Failed to activate fallback model: %s", e)
+            return False
+
+    def _try_restore_primary(self) -> bool:
+        """Periodically re-probe the primary provider after fallback activation.
+
+        If enough time has passed since fallback was activated (default 30min),
+        attempt a lightweight API call to the primary. If it succeeds, restore
+        the primary provider. If it fails, reset the timer and stay on fallback.
+        """
+        if (
+            not self._fallback_activated
+            or self._primary_state is None
+            or self._fallback_activated_at is None
+        ):
+            return False
+
+        elapsed = time.time() - self._fallback_activated_at
+        if elapsed < self._fallback_reprobe_interval:
+            return False
+
+        ps = self._primary_state
+        try:
+            # Lightweight probe: list models or send a tiny completion
+            test_client = ps["client"]
+            if test_client is None:
+                return False
+
+            if ps["api_mode"] == "codex_responses":
+                test_client.responses.create(
+                    model=ps["model"],
+                    input="test",
+                    max_output_tokens=1,
+                    timeout=10.0,
+                )
+            else:
+                test_client.chat.completions.create(
+                    model=ps["model"],
+                    messages=[{"role": "user", "content": "test"}],
+                    max_tokens=1,
+                    timeout=10.0,
+                )
+
+            # Success — restore primary
+            self.model = ps["model"]
+            self.provider = ps["provider"]
+            self.base_url = ps["base_url"]
+            self.api_mode = ps["api_mode"]
+            self.client = ps["client"]
+            self._client_kwargs = ps["client_kwargs"]
+            self._use_prompt_caching = ps["use_prompt_caching"]
+            # Restore Anthropic-specific state
+            if ps.get("_anthropic_client") is not None:
+                self._anthropic_client = ps["_anthropic_client"]
+                self._anthropic_api_key = ps["_anthropic_api_key"]
+                self._anthropic_base_url = ps["_anthropic_base_url"]
+            self._is_anthropic_oauth = ps.get("_is_anthropic_oauth", False)
+            self._fallback_activated = False
+            self._fallback_activated_at = None
+            self._primary_state = None
+
+            print(
+                f"{self.log_prefix}🔄 Primary provider restored: "
+                f"{self.model} via {self.provider}"
+            )
+            logging.info("Primary restored: %s (%s)", self.model, self.provider)
+            return True
+        except Exception as e:
+            # Primary still down — reset timer and stay on fallback
+            self._fallback_activated_at = time.time()
+            logging.debug("Primary re-probe failed, staying on fallback: %s", e)
             return False
 
     # ── End provider fallback ──────────────────────────────────────────────
@@ -5024,6 +5113,10 @@ class AIAgent:
                     self._safe_print(f"\n⚡ Breaking out of tool loop due to interrupt...")
                 break
             
+            # Re-probe primary provider if we've been on fallback long enough
+            if self._fallback_activated:
+                self._try_restore_primary()
+
             api_call_count += 1
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
