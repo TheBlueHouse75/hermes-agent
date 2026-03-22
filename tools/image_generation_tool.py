@@ -28,18 +28,28 @@ Usage:
     )
 """
 
+import base64
 import json
 import logging
 import os
 import datetime
+from pathlib import Path
 from typing import Dict, Any, Optional, Union
 import fal_client
+from hermes_cli.env_loader import load_hermes_dotenv
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
 
+
+def _refresh_image_env() -> None:
+    """Load ~/.hermes/.env on demand so long-lived runtimes see updated keys."""
+    load_hermes_dotenv()
+
+
 # Configuration for image generation
 DEFAULT_MODEL = "fal-ai/flux-2-pro"
+DEFAULT_OPENAI_MODEL = "gpt-image-1.5"
 DEFAULT_ASPECT_RATIO = "landscape"
 DEFAULT_NUM_INFERENCE_STEPS = 50
 DEFAULT_GUIDANCE_SCALE = 4.5
@@ -55,6 +65,11 @@ ASPECT_RATIO_MAP = {
     "landscape": "landscape_16_9",
     "square": "square_hd",
     "portrait": "portrait_16_9"
+}
+OPENAI_SIZE_MAP = {
+    "landscape": "1536x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1536",
 }
 VALID_ASPECT_RATIOS = list(ASPECT_RATIO_MAP.keys())
 
@@ -77,6 +92,15 @@ VALID_OUTPUT_FORMATS = ["jpeg", "png"]
 VALID_ACCELERATION_MODES = ["none", "regular", "high"]
 
 _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
+
+
+def _clean_env_secret(name: str) -> str:
+    """Return a sanitized secret value, treating control-char garbage as unset."""
+    raw = os.getenv(name, "")
+    if not raw:
+        return ""
+    cleaned = "".join(ch for ch in raw.strip() if ch.isprintable())
+    return cleaned.strip()
 
 
 def _validate_parameters(
@@ -213,6 +237,158 @@ def _upscale_image(image_url: str, original_prompt: str) -> Dict[str, Any]:
         return None
 
 
+def check_openai_api_key() -> bool:
+    """Check if an OpenAI-compatible API key is available."""
+    _refresh_image_env()
+    return bool(_clean_env_secret("OPENAI_API_KEY"))
+
+
+
+def _get_available_backend() -> Optional[str]:
+    """Return the preferred image backend available in the current environment."""
+    if check_fal_api_key():
+        return "fal"
+    if check_openai_api_key():
+        return "openai"
+    return None
+
+
+
+def _get_generated_images_dir() -> Path:
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
+    output_dir = hermes_home / "generated-images"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+
+def _save_base64_image(image_b64: str, output_format: str) -> str:
+    suffix = ".png" if output_format == "png" else ".jpg"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    output_path = _get_generated_images_dir() / f"image-{timestamp}{suffix}"
+    output_path.write_bytes(base64.b64decode(image_b64))
+    return str(output_path)
+
+
+
+def _generate_with_openai(
+    prompt: str,
+    aspect_ratio: str,
+    output_format: str,
+) -> Dict[str, Any]:
+    from openai import OpenAI
+
+    _refresh_image_env()
+    client_kwargs = {"api_key": _clean_env_secret("OPENAI_API_KEY")}
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    client = OpenAI(**client_kwargs)
+    response = client.images.generate(
+        model=os.getenv("OPENAI_IMAGE_MODEL", DEFAULT_OPENAI_MODEL),
+        prompt=prompt,
+        size=OPENAI_SIZE_MAP[aspect_ratio],
+        quality="high",
+    )
+
+    data = getattr(response, "data", None) or []
+    if not data:
+        raise ValueError("Invalid response from OpenAI image API - no images returned")
+
+    first_image = data[0]
+    image_url = getattr(first_image, "url", None) or (first_image.get("url") if isinstance(first_image, dict) else None)
+    if image_url:
+        return {"url": image_url, "upscaled": False, "backend": "openai"}
+
+    image_b64 = getattr(first_image, "b64_json", None) or (first_image.get("b64_json") if isinstance(first_image, dict) else None)
+    if image_b64:
+        return {
+            "url": _save_base64_image(image_b64, output_format),
+            "upscaled": False,
+            "backend": "openai",
+        }
+
+    raise ValueError("Invalid response from OpenAI image API - missing image payload")
+
+
+
+def _generate_with_fal(
+    prompt: str,
+    aspect_ratio_lower: str,
+    image_size: str,
+    num_inference_steps: int,
+    guidance_scale: float,
+    num_images: int,
+    output_format: str,
+    seed: Optional[int],
+) -> Dict[str, Any]:
+    validated_params = _validate_parameters(
+        image_size, num_inference_steps, guidance_scale, num_images, output_format, "none"
+    )
+
+    arguments = {
+        "prompt": prompt.strip(),
+        "image_size": validated_params["image_size"],
+        "num_inference_steps": validated_params["num_inference_steps"],
+        "guidance_scale": validated_params["guidance_scale"],
+        "num_images": validated_params["num_images"],
+        "output_format": validated_params["output_format"],
+        "enable_safety_checker": ENABLE_SAFETY_CHECKER,
+        "safety_tolerance": SAFETY_TOLERANCE,
+        "sync_mode": True,
+    }
+
+    if seed is not None and isinstance(seed, int):
+        arguments["seed"] = seed
+
+    logger.info("Submitting generation request to FAL.ai FLUX 2 Pro...")
+    logger.info("  Model: %s", DEFAULT_MODEL)
+    logger.info("  Aspect Ratio: %s -> %s", aspect_ratio_lower, image_size)
+    logger.info("  Steps: %s", validated_params["num_inference_steps"])
+    logger.info("  Guidance: %s", validated_params["guidance_scale"])
+
+    handler = fal_client.submit(
+        DEFAULT_MODEL,
+        arguments=arguments
+    )
+    result = handler.get()
+
+    if not result or "images" not in result:
+        raise ValueError("Invalid response from FAL.ai API - no images returned")
+
+    images = result.get("images", [])
+    if not images:
+        raise ValueError("No images were generated")
+
+    formatted_images = []
+    for img in images:
+        if isinstance(img, dict) and "url" in img:
+            original_image = {
+                "url": img["url"],
+                "width": img.get("width", 0),
+                "height": img.get("height", 0)
+            }
+
+            upscaled_image = _upscale_image(img["url"], prompt.strip())
+            if upscaled_image:
+                formatted_images.append(upscaled_image)
+            else:
+                logger.warning("Using original image as fallback")
+                original_image["upscaled"] = False
+                formatted_images.append(original_image)
+
+    if not formatted_images:
+        raise ValueError("No valid image URLs returned from API")
+
+    return {
+        "url": formatted_images[0]["url"],
+        "count": len(formatted_images),
+        "upscaled_count": sum(1 for img in formatted_images if img.get("upscaled", False)),
+        "backend": "fal",
+    }
+
+
 def image_generate_tool(
     prompt: str,
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
@@ -279,93 +455,49 @@ def image_generate_tool(
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
         
-        # Check API key availability
-        if not os.getenv("FAL_KEY"):
-            raise ValueError("FAL_KEY environment variable not set")
-        
-        # Validate other parameters
-        validated_params = _validate_parameters(
-            image_size, num_inference_steps, guidance_scale, num_images, output_format, "none"
-        )
-        
-        # Prepare arguments for FAL.ai FLUX 2 Pro API
-        arguments = {
-            "prompt": prompt.strip(),
-            "image_size": validated_params["image_size"],
-            "num_inference_steps": validated_params["num_inference_steps"],
-            "guidance_scale": validated_params["guidance_scale"],
-            "num_images": validated_params["num_images"],
-            "output_format": validated_params["output_format"],
-            "enable_safety_checker": ENABLE_SAFETY_CHECKER,
-            "safety_tolerance": SAFETY_TOLERANCE,
-            "sync_mode": True  # Use sync mode for immediate results
-        }
-        
-        # Add seed if provided
-        if seed is not None and isinstance(seed, int):
-            arguments["seed"] = seed
-        
-        logger.info("Submitting generation request to FAL.ai FLUX 2 Pro...")
-        logger.info("  Model: %s", DEFAULT_MODEL)
-        logger.info("  Aspect Ratio: %s -> %s", aspect_ratio_lower, image_size)
-        logger.info("  Steps: %s", validated_params['num_inference_steps'])
-        logger.info("  Guidance: %s", validated_params['guidance_scale'])
-        
-        # Submit request to FAL.ai using sync API (avoids cached event loop issues)
-        handler = fal_client.submit(
-            DEFAULT_MODEL,
-            arguments=arguments
-        )
-        
-        # Get the result (sync — blocks until done)
-        result = handler.get()
-        
+        backend = _get_available_backend()
+        if not backend:
+            raise ValueError("Neither FAL_KEY nor OPENAI_API_KEY environment variable is set")
+
+        logger.info("Using image backend: %s", backend)
+
+        if backend == "fal":
+            generation_result = _generate_with_fal(
+                prompt=prompt,
+                aspect_ratio_lower=aspect_ratio_lower,
+                image_size=image_size,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                num_images=num_images,
+                output_format=output_format,
+                seed=seed,
+            )
+        else:
+            generation_result = _generate_with_openai(
+                prompt=prompt.strip(),
+                aspect_ratio=aspect_ratio_lower,
+                output_format=output_format,
+            )
+
         generation_time = (datetime.datetime.now() - start_time).total_seconds()
-        
-        # Process the response
-        if not result or "images" not in result:
-            raise ValueError("Invalid response from FAL.ai API - no images returned")
-        
-        images = result.get("images", [])
-        if not images:
-            raise ValueError("No images were generated")
-        
-        # Format image data and upscale images
-        formatted_images = []
-        for img in images:
-            if isinstance(img, dict) and "url" in img:
-                original_image = {
-                    "url": img["url"],
-                    "width": img.get("width", 0),
-                    "height": img.get("height", 0)
-                }
-                
-                # Attempt to upscale the image
-                upscaled_image = _upscale_image(img["url"], prompt.strip())
-                
-                if upscaled_image:
-                    # Use upscaled image if successful
-                    formatted_images.append(upscaled_image)
-                else:
-                    # Fall back to original image if upscaling fails
-                    logger.warning("Using original image as fallback")
-                    original_image["upscaled"] = False
-                    formatted_images.append(original_image)
-        
-        if not formatted_images:
-            raise ValueError("No valid image URLs returned from API")
-        
-        upscaled_count = sum(1 for img in formatted_images if img.get("upscaled", False))
-        logger.info("Generated %s image(s) in %.1fs (%s upscaled)", len(formatted_images), generation_time, upscaled_count)
-        
+        generated_count = generation_result.get("count", 1)
+        upscaled_count = generation_result.get("upscaled_count", 0)
+        logger.info(
+            "Generated %s image(s) in %.1fs via %s (%s upscaled)",
+            generated_count,
+            generation_time,
+            generation_result.get("backend", backend),
+            upscaled_count,
+        )
+
         # Prepare successful response - minimal format
         response_data = {
             "success": True,
-            "image": formatted_images[0]["url"] if formatted_images else None
+            "image": generation_result["url"]
         }
         
         debug_call_data["success"] = True
-        debug_call_data["images_generated"] = len(formatted_images)
+        debug_call_data["images_generated"] = generated_count
         debug_call_data["generation_time"] = generation_time
         
         # Log debug information
@@ -398,9 +530,10 @@ def check_fal_api_key() -> bool:
     Check if the FAL.ai API key is available in environment variables.
     
     Returns:
-        bool: True if API key is set, False otherwise
+        bool: True if FAL_KEY is available, False otherwise
     """
-    return bool(os.getenv("FAL_KEY"))
+    _refresh_image_env()
+    return bool(_clean_env_secret("FAL_KEY"))
 
 
 def check_image_generation_requirements() -> bool:
@@ -411,13 +544,14 @@ def check_image_generation_requirements() -> bool:
         bool: True if requirements are met, False otherwise
     """
     try:
-        # Check API key
-        if not check_fal_api_key():
-            return False
-        
-        # Check if fal_client is available
-        import fal_client
-        return True
+        backend = _get_available_backend()
+        if backend == "fal":
+            import fal_client
+            return True
+        if backend == "openai":
+            import openai
+            return True
+        return False
         
     except ImportError:
         return False
@@ -515,7 +649,7 @@ from tools.registry import registry
 
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
-    "description": "Generate high-quality images from text prompts using FLUX 2 Pro model with automatic 2x upscaling. Creates detailed, artistic images that are automatically upscaled for hi-rez results. Returns a single upscaled image URL. Display it using markdown: ![description](URL)",
+    "description": "Generate high-quality images from text prompts. Uses FLUX 2 Pro with automatic 2x upscaling when FAL is configured, otherwise falls back to OpenAI image generation when an OpenAI API key is available. Returns a single image URL or absolute local file path. For local files, send it with MEDIA:/absolute/path.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -556,7 +690,7 @@ registry.register(
     schema=IMAGE_GENERATE_SCHEMA,
     handler=_handle_image_generate,
     check_fn=check_image_generation_requirements,
-    requires_env=["FAL_KEY"],
+    requires_env=["FAL_KEY", "OPENAI_API_KEY"],
     is_async=False,  # Switched to sync fal_client API to fix "Event loop is closed" in gateway
     emoji="🎨",
 )

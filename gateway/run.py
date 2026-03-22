@@ -4353,16 +4353,69 @@ class GatewayRunner:
                 pass
 
             model = _resolve_gateway_model()
+            primary_model = model
 
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs()
             except Exception as exc:
-                return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
-                    "messages": [],
-                    "api_calls": 0,
-                    "tools": [],
-                }
+                fallback = self._fallback_model or {}
+                fallback_provider = fallback.get("provider")
+                fallback_model = fallback.get("model")
+                fallback_error = None
+                runtime_kwargs = None
+
+                if fallback_provider and fallback_model:
+                    try:
+                        from hermes_cli.runtime_provider import (
+                            resolve_runtime_provider,
+                            format_runtime_provider_error,
+                        )
+
+                        runtime = resolve_runtime_provider(
+                            requested=fallback_provider,
+                            explicit_api_key=fallback.get("api_key"),
+                            explicit_base_url=fallback.get("base_url"),
+                        )
+                        runtime_kwargs = {
+                            "provider": runtime.get("provider"),
+                            "api_mode": runtime.get("api_mode"),
+                            "base_url": runtime.get("base_url"),
+                            "api_key": runtime.get("api_key"),
+                        }
+                        model = fallback_model
+                        logger.warning(
+                            "Gateway runtime provider resolution failed for %s: %s. Falling back to %s via %s.",
+                            primary_model,
+                            exc,
+                            fallback_model,
+                            fallback_provider,
+                        )
+                    except Exception as fallback_exc:
+                        try:
+                            fallback_error = format_runtime_provider_error(fallback_exc)
+                        except Exception:
+                            fallback_error = str(fallback_exc)
+                        logger.warning(
+                            "Gateway runtime provider resolution failed for %s: %s. Fallback %s via %s also failed: %s",
+                            primary_model,
+                            exc,
+                            fallback_model,
+                            fallback_provider,
+                            fallback_error,
+                        )
+
+                if runtime_kwargs is None:
+                    error_text = str(exc)
+                    if fallback_error:
+                        error_text = (
+                            f"{error_text}; fallback {fallback_provider}/{fallback_model} failed: {fallback_error}"
+                        )
+                    return {
+                        "final_response": f"⚠️ Provider authentication failed: {error_text}",
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
 
             pr = self._provider_routing
             honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
