@@ -77,6 +77,24 @@ terminal:
   timeout: 180      # Command timeout in seconds
 ```
 
+The generic tool executor has a separate deadline. Its sequential and
+concurrent defaults are 420 seconds, while foreground terminal commands allow
+up to 600 seconds. To let an explicitly long foreground command use the full
+terminal budget, align the executor deadlines in `config.yaml`:
+
+```yaml
+timeouts:
+  tools:
+    sequential_call: 660
+    concurrent_batch: 660
+```
+
+The executor deadline starts before terminal setup and middleware, so it must
+be greater than the terminal's 600-second cap; 660 seconds leaves bounded
+overhead without making foreground calls open-ended. Use background process
+management for commands expected to run longer than 600 seconds. Raising the
+executor deadlines does not increase the foreground terminal cap.
+
 ### Shell startup files and non-interactive commands
 
 Agent terminal calls run your shell **non-interactively** — there is no TTY and no human at the prompt. Heavy or interactive shell initialisation that you never notice in a normal terminal can break or badly slow every command the agent runs:

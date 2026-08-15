@@ -111,6 +111,23 @@ class TestConfigYamlRouting:
         assert "not a recognized config key" not in capsys.readouterr().out
         assert "script_timeout_seconds: 600" in _read_config(_isolated_hermes_home)
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "timeouts.tools.sequential_call",
+            "timeouts.tools.concurrent_batch",
+        ],
+    )
+    def test_tool_executor_timeout_is_recognized(
+        self, key, _isolated_hermes_home, capsys
+    ):
+        """Timeout keys consumed by agent.deadline must be accepted by config set."""
+        set_config_value(key, "660")
+
+        assert "not a recognized config key" not in capsys.readouterr().out
+        config = _read_config(_isolated_hermes_home)
+        assert "660" in config
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)
@@ -500,6 +517,8 @@ class TestValidateConfigKey:
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
         "approvals.mode",
+        "timeouts.tools.sequential_call",
+        "timeouts.tools.concurrent_batch",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key
@@ -518,6 +537,16 @@ class TestValidateConfigKey:
         if expected_in_suggestion is not None:
             assert suggestion is not None and expected_in_suggestion in suggestion, \
                 f"Expected suggestion to contain {expected_in_suggestion!r}, got {suggestion!r}"
+
+    def test_misspelled_tool_timeout_is_rejected_with_suggestion(self):
+        from hermes_cli.config import _validate_config_key
+
+        is_known, suggestion = _validate_config_key(
+            "timeouts.tools.sequentail_call"
+        )
+
+        assert not is_known
+        assert suggestion == "timeouts.tools.sequential_call"
 
 
     def test_underscore_only_first_segment_escapes(self):

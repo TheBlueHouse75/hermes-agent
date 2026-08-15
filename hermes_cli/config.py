@@ -4999,6 +4999,16 @@ _SCHEMA_DEFINED_DICT_KEYS = frozenset({
     "plugins",
 })
 
+# Timeout paths consumed by ``agent.deadline.resolve_timeout``. Keep this
+# closed rather than accepting every descendant of ``timeouts``: a typo in a
+# timeout path would otherwise be saved successfully and ignored at runtime.
+# These paths intentionally stay out of DEFAULT_CONFIG so legacy timeout env
+# bridges still win when the user has not explicitly configured a value.
+_KNOWN_TIMEOUT_CONFIG_KEYS = frozenset({
+    "timeouts.tools.sequential_call",
+    "timeouts.tools.concurrent_batch",
+})
+
 # Top-level keys that can be ANY user-supplied name (platform/provider dict
 # shapes where the outer key IS user-defined).
 _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
@@ -5027,6 +5037,7 @@ def _known_top_level_keys() -> set[str]:
     keys.update(_OPEN_DICT_TOP_LEVEL_KEYS)
     keys.update(_DYNAMIC_TOP_LEVEL_KEYS)
     keys.update(_SCHEMA_DEFINED_DICT_KEYS)
+    keys.update(path.split(".", 1)[0] for path in _KNOWN_TIMEOUT_CONFIG_KEYS)
     return keys
 
 
@@ -5098,6 +5109,11 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
             return False, suggested_full
 
         return False, None
+
+    if top == "timeouts":
+        if key in _KNOWN_TIMEOUT_CONFIG_KEYS:
+            return True, None
+        return False, _suggest_closest_key(key, set(_KNOWN_TIMEOUT_CONFIG_KEYS))
 
     # ── Deeper validation ────────────────────────────────────────────
     # Walk DEFAULT_CONFIG along the user's segments. Stop at:
