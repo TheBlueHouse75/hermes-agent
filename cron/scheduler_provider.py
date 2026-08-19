@@ -511,6 +511,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_routes=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -538,6 +539,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_routes=profile_routes,
             )
             return
 
@@ -609,6 +611,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_routes=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -619,7 +622,7 @@ class InProcessCronScheduler(CronScheduler):
         ``web_server.py`` scopes per-profile cron API calls.
         """
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import CronDeliveryContext, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -661,6 +664,7 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
+                        profile_name = entry[0] if isinstance(entry, tuple) else "default"
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
@@ -671,6 +675,14 @@ class InProcessCronScheduler(CronScheduler):
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
+                                    delivery_context=(
+                                        None
+                                        if profile_name == "default"
+                                        else CronDeliveryContext(
+                                            profile_name=profile_name,
+                                            profile_routes=tuple(profile_routes or ()),
+                                        )
+                                    ),
                                 )
                         finally:
                             reset_hermes_home_override(home_token)

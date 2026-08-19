@@ -594,6 +594,7 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     scoped via use_cron_store, so secondary-profile jobs actually fire
     instead of languishing in an unticked store."""
     from cron.scheduler_provider import InProcessCronScheduler
+    from gateway.profile_routing import ProfileRoute
 
     # Set up two profile directories.
     p1 = tmp_path / "default"
@@ -602,12 +603,18 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         (d / "cron").mkdir(parents=True)
 
     profile_homes = [("default", p1), ("home-ops", p2)]
+    route = ProfileRoute(
+        name="home-ops",
+        platform="discord",
+        chat_id="OPS",
+        profile="home-ops",
+    )
 
     # Count tick() calls — should be called once per profile per iteration.
-    tick_count: list[int] = []
+    tick_contexts = []
 
     def _tracking_tick(*args, **kwargs):
-        tick_count.append(1)
+        tick_contexts.append(kwargs.get("delivery_context"))
         return 0
 
     stop = threading.Event()
@@ -618,17 +625,21 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         t = threading.Thread(
             target=prov.start,
             args=(stop,),
-            kwargs={"interval": 0, "profile_homes": profile_homes},
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "profile_routes": (route,),
+            },
             daemon=True,
         )
         t.start()
         # Wait for at least len(profile_homes) tick calls (one full cycle).
         deadline = time.monotonic() + 10
-        while len(tick_count) < len(profile_homes) and time.monotonic() < deadline:
+        while len(tick_contexts) < len(profile_homes) and time.monotonic() < deadline:
             time.sleep(0.005)
         # Give one more cycle to ensure it keeps ticking.
         deadline = time.monotonic() + 3
-        while len(tick_count) < len(profile_homes) * 2 and time.monotonic() < deadline:
+        while len(tick_contexts) < len(profile_homes) * 2 and time.monotonic() < deadline:
             time.sleep(0.005)
         stop.set()
         t.join(timeout=5)
@@ -636,7 +647,8 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     assert not t.is_alive()
     # The ticker called tick() at least once per profile per iteration.
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
-    assert len(tick_count) >= len(profile_homes), \
-        f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
-
+    assert len(tick_contexts) >= len(profile_homes), \
+        f"Expected >= {len(profile_homes)} tick calls, got {len(tick_contexts)}"
+    assert tick_contexts[0] is None
+    assert tick_contexts[1].profile_name == "home-ops"
+    assert tick_contexts[1].profile_routes == (route,)
