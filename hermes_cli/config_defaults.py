@@ -2400,6 +2400,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Desktop normally starts a profile-local cron scheduler in each
+        # backend it owns. Disable this for profiles whose cron jobs are
+        # already driven by a multiplex gateway scheduler.
+        "desktop_scheduler_enabled": True,
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
         # pattern). Off by default: the cronjob toolset is policy-denied in

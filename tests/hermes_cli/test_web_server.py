@@ -4672,6 +4672,91 @@ class TestDesktopCronTicker:
         with self._client():
             assert called.wait(3.0), "expected cron tick under HERMES_DESKTOP=1"
 
+    @staticmethod
+    def _record_started_threads(monkeypatch):
+        started = []
+        real_start = threading.Thread.start
+
+        def _record_start(thread):
+            if thread.name == "desktop-cron-ticker":
+                started.append(thread.name)
+                return None
+            return real_start(thread)
+
+        monkeypatch.setattr(threading.Thread, "start", _record_start)
+        return started
+
+    @staticmethod
+    def _stub_lifespan_side_effects(monkeypatch, web_server):
+        monkeypatch.setattr(web_server, "_warm_gateway_module", lambda: None)
+        monkeypatch.setattr(
+            web_server, "_eager_reconcile_own_session_db", lambda: None
+        )
+        monkeypatch.setattr(
+            web_server, "_terminate_desktop_managed_gateway", lambda: None
+        )
+        import hermes_cli.gateway as gateway
+
+        monkeypatch.setattr(
+            gateway, "_reap_unsupervised_gateway_orphans", lambda: False
+        )
+
+    def test_ticker_is_skipped_when_profile_config_disables_it(
+        self, monkeypatch, caplog
+    ):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.web_server as web_server
+
+        self._stub_lifespan_side_effects(monkeypatch, web_server)
+        started = self._record_started_threads(monkeypatch)
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        (get_hermes_home() / "config.yaml").write_text(
+            "cron:\n  desktop_scheduler_enabled: false\n",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level("INFO", logger="hermes_cli.web_server"):
+            with self._client():
+                pass
+
+        assert started == []
+        assert "cron.desktop_scheduler_enabled is false" in caplog.text
+
+    def test_ticker_still_starts_when_profile_config_key_is_absent(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        self._stub_lifespan_side_effects(monkeypatch, web_server)
+        started = self._record_started_threads(monkeypatch)
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+
+        with self._client():
+            pass
+
+        assert started == ["desktop-cron-ticker"]
+
+    def test_ticker_still_starts_when_profile_config_load_fails(
+        self, monkeypatch, caplog
+    ):
+        import hermes_cli.web_server as web_server
+
+        self._stub_lifespan_side_effects(monkeypatch, web_server)
+        started = self._record_started_threads(monkeypatch)
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+
+        def _raise_config_error():
+            raise OSError("config unavailable")
+
+        monkeypatch.setattr(web_server, "load_config", _raise_config_error)
+
+        with caplog.at_level("WARNING", logger="hermes_cli.web_server"):
+            with self._client():
+                pass
+
+        assert started == ["desktop-cron-ticker"]
+        assert "keeping the local scheduler enabled" in caplog.text
+
 
 class TestServeIndexMissingIndex:
     """_serve_index must not raise per-request when index.html vanishes

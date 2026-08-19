@@ -261,6 +261,27 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+def _desktop_cron_scheduler_enabled() -> bool:
+    """Return whether this profile's Desktop backend should run cron locally.
+
+    Config failures deliberately fail open so existing Desktop cron behavior
+    survives malformed or temporarily unreadable configuration.
+    """
+    try:
+        config = load_config()
+        cron_config = config.get("cron")
+        if not isinstance(cron_config, dict):
+            return True
+        return cron_config.get("desktop_scheduler_enabled", True) is not False
+    except Exception:
+        _log.warning(
+            "Desktop cron scheduler config load failed; keeping the local "
+            "scheduler enabled",
+            exc_info=True,
+        )
+        return True
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -404,14 +425,20 @@ async def _lifespan(app: "FastAPI"):
         except Exception:
             _log.exception("Desktop startup: orphan gateway reap failed")
 
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+        if _desktop_cron_scheduler_enabled():
+            cron_stop = threading.Event()
+            cron_thread = threading.Thread(
+                target=_start_desktop_cron_ticker,
+                args=(cron_stop,),
+                daemon=True,
+                name="desktop-cron-ticker",
+            )
+            cron_thread.start()
+        else:
+            _log.info(
+                "Desktop cron scheduler skipped: "
+                "cron.desktop_scheduler_enabled is false"
+            )
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))

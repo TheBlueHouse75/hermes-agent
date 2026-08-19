@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -62,6 +63,66 @@ from agent.delegation_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CronDeliveryContext:
+    """Immutable authorization input for one multiplex profile's deliveries.
+
+    The built-in multiplex scheduler constructs this from the profile name it
+    is ticking and the Default gateway's already-parsed ``profile_routes``.
+    Named profiles therefore receive only the routing facts needed to decide
+    whether the shared live transport is theirs to use, never Default's wider
+    config or credentials.
+    """
+
+    profile_name: str
+    profile_routes: tuple[Any, ...] = ()
+
+    def authorizes_shared_target(self, target: dict) -> bool:
+        """Whether Default routes ``target`` to this named profile.
+
+        Reuse the gateway's normal most-specific-first matcher so an exact
+        thread route overrides a channel route and a thread-agnostic route can
+        still authorize channel-level delivery.  Explicit targets carry only
+        platform/chat/thread; origin targets retain guild/parent metadata too.
+        """
+        if self.profile_name == "default":
+            return True
+
+        platform = str(target.get("platform") or "").lower()
+        chat_id = str(target.get("chat_id") or "")
+        if not platform or not chat_id:
+            return False
+        from gateway.profile_routing import match_profile_route
+
+        matched = match_profile_route(
+            self.profile_routes,
+            platform=platform,
+            guild_id=target.get("guild_id"),
+            chat_id=chat_id,
+            thread_id=target.get("thread_id"),
+            parent_chat_id=target.get("parent_chat_id"),
+        )
+        return matched is not None and matched.profile == self.profile_name
+
+
+def _resolve_authorized_delivery_transport(
+    platform,
+    config,
+    adapters,
+    target: dict,
+    delivery_context: Optional[CronDeliveryContext],
+):
+    """Resolve a live transport, withholding shared adapters when unrouted."""
+    from gateway.delivery import resolve_delivery_transport
+
+    transport = resolve_delivery_transport(platform, config, adapters)
+    if transport is None or delivery_context is None:
+        return transport
+    if delivery_context.authorizes_shared_target(target):
+        return transport
+    return None
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
@@ -2155,11 +2216,17 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
-            return {
+            target = {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": _origin_delivery_thread(origin),
             }
+            guild_id = origin.get("scope_id") or origin.get("guild_id")
+            if guild_id is not None:
+                target["guild_id"] = guild_id
+            if origin.get("parent_chat_id") is not None:
+                target["parent_chat_id"] = origin["parent_chat_id"]
+            return target
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _iter_home_target_platforms():
@@ -2507,7 +2574,13 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    delivery_context: Optional[CronDeliveryContext] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2660,11 +2733,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
-        from gateway.delivery import resolve_delivery_transport
-
-        transport = resolve_delivery_transport(platform, config, adapters)
+        transport = _resolve_authorized_delivery_transport(
+            platform,
+            config,
+            adapters,
+            target,
+            delivery_context,
+        )
         if transport is not None:
-            pconfig = transport.config
+            # Multiplexed profile schedulers load the target profile's config,
+            # which intentionally may not repeat the credential-bearing platform
+            # block owned by the shared gateway.  In that case the resolved live
+            # native adapter is authoritative for its runtime config.
+            pconfig = transport.config or getattr(transport.adapter, "config", None)
             runtime_adapter = transport.adapter
         else:
             # No live transport: preserve the existing standalone delivery path,
@@ -4315,17 +4396,22 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _preflight_check_delivery(
+    job: dict,
+    adapters=None,
+    delivery_context: Optional[CronDeliveryContext] = None,
+) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
-    ``local``/``origin`` (and the ``all`` routing token) need no gateway
-    credentials and are never checked — a deliver=local job must not pay a
-    gateway-config load. For concrete platform targets, an unknown platform
-    always blocks; a known platform additionally blocks when the gateway
-    config is loadable and reports it unconnected (enabled + credentials —
-    the same source `cron_delivery_targets` uses). Gateway-config load
-    failures fail OPEN so a transient config hiccup never wedges delivery
-    that would have worked.
+    ``local`` never needs gateway credentials. ``origin`` and ``all`` keep the
+    legacy no-load behavior except in a live named-profile multiplex context,
+    where their concrete targets must be authorized before shared adapters can
+    satisfy this check. For concrete platform targets, an unknown platform
+    always blocks; a known platform additionally blocks when the profile-local
+    gateway config is loadable and reports it unconnected (enabled +
+    credentials — the same source `cron_delivery_targets` uses). Gateway-config
+    load failures fail OPEN so a transient config hiccup never wedges delivery
+    that would have worked; final delivery still applies the same authorization.
     """
     deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
     platform_parts: list[str] = []
@@ -4334,10 +4420,6 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
         if not part or part.lower() in {"local", "origin", "all"}:
             continue
         platform_parts.append(part.split(":", 1)[0].strip())
-    if not platform_parts:
-        return None
-
-    connected: Optional[set] = None
     for platform_name in platform_parts:
         if not _is_known_delivery_platform(platform_name):
             return (
@@ -4345,9 +4427,29 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+    delivery_targets = (
+        _resolve_delivery_targets(job)
+        if delivery_context is not None and adapters is not None
+        else []
+    )
+    if not platform_parts and not delivery_targets:
+        return None
+
+    connected: Optional[set] = None
+    resolved_platforms = {
+        str(target.get("platform") or "").lower() for target in delivery_targets
+    }
+    targets_to_check = list(delivery_targets)
+    targets_to_check.extend(
+        {"platform": platform_name, "chat_id": ""}
+        for platform_name in platform_parts
+        if platform_name.lower() not in resolved_platforms
+    )
+    for target in targets_to_check:
+        platform_name = str(target["platform"])
         if connected is None:
             try:
-                from gateway.config import load_gateway_config
+                from gateway.config import Platform, load_gateway_config
 
                 gateway_config = load_gateway_config()
                 connected = {
@@ -4360,6 +4462,15 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                     "delivery credential check", exc_info=True,
                 )
                 return None  # fail-open
+        platform = Platform(platform_name.lower())
+        if _resolve_authorized_delivery_transport(
+            platform,
+            gateway_config,
+            adapters,
+            target,
+            delivery_context,
+        ) is not None:
+            continue
         if platform_name.lower() not in connected:
             return (
                 f"delivery platform '{platform_name}' has no gateway "
@@ -4425,7 +4536,12 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(
+    job: dict,
+    cfg: dict,
+    adapters=None,
+    delivery_context: Optional[CronDeliveryContext] = None,
+) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -4444,7 +4560,14 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        (
+            "delivery",
+            lambda: _preflight_check_delivery(
+                job,
+                adapters=adapters,
+                delivery_context=delivery_context,
+            ),
+        ),
     ):
         try:
             reason = check()
@@ -4588,6 +4711,8 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    adapters=None,
+    delivery_context: Optional[CronDeliveryContext] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -4605,6 +4730,13 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run',
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
+
+    ``adapters``: optional live gateway transports used only by delivery
+    preflight. Standalone/manual callers keep the profile-local credential
+    check by leaving it unset.
+
+    ``delivery_context``: immutable multiplex route authorization supplied by
+    the built-in gateway scheduler. Direct/manual callers leave it unset.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5262,7 +5394,12 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(
+                    job,
+                    _cfg,
+                    adapters=adapters,
+                    delivery_context=delivery_context,
+                )
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -6142,6 +6279,7 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    delivery_context: Optional[CronDeliveryContext] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -6180,6 +6318,7 @@ def run_one_job(
                 loop=loop,
                 verbose=verbose,
                 extra_prompt=extra_prompt,
+                delivery_context=delivery_context,
                 fire_claim_lost=(
                     _CombinedCancelEvent(lost_ownership, cancel_event)
                     if cancel_event is not None
@@ -6206,6 +6345,7 @@ def _run_one_job_body(
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
+    delivery_context: Optional[CronDeliveryContext] = None,
 ) -> bool:
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
@@ -6291,19 +6431,17 @@ def _run_one_job_body(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            if fire_claim_lost is None:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                )
-            else:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                    cancel_event=fire_claim_lost,
-                )
+            run_job_kwargs = {
+                "defer_agent_teardown": _deferred_agents,
+                "extra_prompt": extra_prompt,
+            }
+            if fire_claim_lost is not None:
+                run_job_kwargs["cancel_event"] = fire_claim_lost
+            if adapters is not None:
+                run_job_kwargs["adapters"] = adapters
+            if delivery_context is not None:
+                run_job_kwargs["delivery_context"] = delivery_context
+            success, output, final_response, error = run_job(job, **run_job_kwargs)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -6467,11 +6605,16 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
+                        delivery_kwargs = {
+                            "adapters": adapters,
+                            "loop": loop,
+                        }
+                        if delivery_context is not None:
+                            delivery_kwargs["delivery_context"] = delivery_context
                         delivery_error = _deliver_result(
                             job,
                             deliver_content,
-                            adapters=adapters,
-                            loop=loop,
+                            **delivery_kwargs,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -6606,11 +6749,16 @@ def _run_one_job_body(
             unresolved_origin = False
             try:
                 delivery_attempted = True
+                delivery_kwargs = {
+                    "adapters": adapters,
+                    "loop": loop,
+                }
+                if delivery_context is not None:
+                    delivery_kwargs["delivery_context"] = delivery_context
                 delivery_error = _deliver_result(
                     job,
                     _summarize_cron_failure_for_delivery(job, _err_text),
-                    adapters=adapters,
-                    loop=loop,
+                    **delivery_kwargs,
                 )
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
@@ -6734,6 +6882,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    delivery_context: Optional[CronDeliveryContext] = None,
 ):
     """
     Check and run all due jobs.
@@ -6953,6 +7102,7 @@ def tick(
                 adapters=adapters,
                 loop=loop,
                 verbose=verbose,
+                delivery_context=delivery_context,
             )
 
         # Partition due jobs: those with a per-job workdir mutate

@@ -108,6 +108,20 @@ def _gateway_config(connected_values):
 
 
 class TestPreflightRelayFronted:
+    def test_live_relay_adapter_accepted_without_local_platform_config(self):
+        """The shared live relay is authoritative for a named profile."""
+        from gateway.config import GatewayConfig, Platform
+
+        relay = MagicMock()
+        relay.fronts_platform.side_effect = lambda platform: platform == Platform.SLACK
+        config = GatewayConfig(platforms={})
+
+        with patch("gateway.config.load_gateway_config", return_value=config):
+            assert _preflight_check_delivery(
+                {"deliver": "slack:D0BJTDCSR7C"},
+                adapters={Platform.RELAY: relay},
+            ) is None
+
     def test_relay_fronted_slack_accepted(self, monkeypatch):
         """Relay-only topology fronting slack: slack:CHAT passes preflight."""
         monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "slack")

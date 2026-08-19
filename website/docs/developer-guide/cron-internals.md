@@ -129,6 +129,30 @@ A provider only controls the trigger, never execution.
 
 In CLI mode, cron jobs only fire when `hermes cron` commands are run or during active CLI sessions.
 
+### Multi-profile multiplex ownership
+
+A gateway configured with `gateway.multiplex_profiles` is the sole scheduler and
+transport owner for the profiles in its allowlist. The built-in provider ticks
+each profile store while keeping execution isolated to that profile's
+`HERMES_HOME`.
+
+Named profiles may reuse the Default gateway's live platform adapter only when
+an enabled `gateway.profile_routes` entry routes the exact platform/chat/thread
+target to that same profile. Preflight and final delivery apply the same route
+authorization; a sibling or unrouted target cannot inherit Default credentials.
+
+Hermes Desktop normally starts a local scheduler in every profile backend. When
+the multiplex gateway owns that profile's cron store, disable the competing
+Desktop scheduler in the profile-local config while leaving its UI backend
+running:
+
+```yaml
+cron:
+  desktop_scheduler_enabled: false
+```
+
+The default is `true` for backwards compatibility with Desktop-only setups.
+
 ### Managed cron (Chronos) for scale-to-zero
 
 Hosted gateways can run the **Chronos** provider (`cron.provider: chronos`)

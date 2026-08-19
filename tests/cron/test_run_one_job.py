@@ -267,12 +267,14 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
 
     scope_during_run = {}
+    live_adapters = object()
 
     def fake_run_job(job, *, defer_agent_teardown=None, **kw):
         # This is where resolve_runtime_provider() would read a secret. Prove a
         # scope is installed and the profile's secret resolves without raising.
         scope_during_run["scope"] = ss.current_secret_scope()
         scope_during_run["base_url"] = ss.get_secret("OPENROUTER_BASE_URL")
+        scope_during_run["adapters"] = kw.get("adapters")
         return (True, "out", "final", None)
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -282,7 +284,10 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
 
     ss.set_multiplex_active(True)
     try:
-        ok = s.run_one_job({"id": "j7", "name": "t"})
+        ok = s.run_one_job(
+            {"id": "j7", "name": "t"},
+            adapters=live_adapters,
+        )
     finally:
         ss.set_multiplex_active(False)
 
@@ -290,7 +295,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     # Scope was installed during run_job and the profile secret resolved.
     assert scope_during_run["scope"] is not None
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
+    assert scope_during_run["adapters"] is live_adapters
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
 

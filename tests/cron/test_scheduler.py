@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import (
+    CronDeliveryContext,
     SILENT_MARKER,
     _build_job_prompt,
     _deliver_result,
@@ -431,6 +432,100 @@ class TestDeliverResultWrapping:
         assert media_metadata["user_id"] == "U123"
         standalone_send.assert_not_awaited()
 
+    def test_multiplex_profile_uses_live_native_adapter_without_local_platform_config(self):
+        """A routed profile reuses the gateway's live Discord adapter."""
+        from concurrent.futures import Future
+
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.profile_routing import ProfileRoute
+
+        adapter = AsyncMock()
+        adapter.config = PlatformConfig(enabled=True)
+        adapter.send.return_value = MagicMock(success=True)
+
+        config = GatewayConfig(platforms={})
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "multiplex-profile-cron",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "9876"},
+        }
+        delivery_context = CronDeliveryContext(
+            profile_name="builder",
+            profile_routes=(
+                ProfileRoute(
+                    name="Builder",
+                    platform="discord",
+                    chat_id="9876",
+                    profile="builder",
+                ),
+            ),
+        )
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+        ):
+            result = _deliver_result(
+                job,
+                "scheduled result",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+                delivery_context=delivery_context,
+            )
+
+        assert result is None
+        adapter.send.assert_awaited_once()
+
+    def test_multiplex_profile_cannot_deliver_through_sibling_route(self):
+        """Final delivery withholds Default's adapter from an unrouted profile."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.profile_routing import ProfileRoute
+
+        adapter = AsyncMock()
+        adapter.config = PlatformConfig(enabled=True)
+        config = GatewayConfig(platforms={})
+        delivery_context = CronDeliveryContext(
+            profile_name="builder",
+            profile_routes=(
+                ProfileRoute(
+                    name="GGA",
+                    platform="discord",
+                    chat_id="GGA",
+                    profile="gga",
+                ),
+            ),
+        )
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("tools.send_message_tool._send_to_platform") as standalone_send,
+        ):
+            result = _deliver_result(
+                {"id": "builder-to-gga", "deliver": "discord:GGA"},
+                "scheduled result",
+                adapters={Platform.DISCORD: adapter},
+                loop=MagicMock(),
+                delivery_context=delivery_context,
+            )
+
+        assert result == "platform 'discord' not configured/enabled"
+        adapter.send.assert_not_awaited()
+        standalone_send.assert_not_called()
 
     def test_live_adapter_sends_media_as_attachments(self, tmp_path, monkeypatch):
         """When a live adapter is available, MEDIA files should be sent as native

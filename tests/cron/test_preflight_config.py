@@ -62,7 +62,15 @@ class _AuthErrorFactory:
         raise AuthError("No API key configured for provider 'openrouter'")
 
 
-def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
+def _run_job_patched(
+    job,
+    tmp_path,
+    *,
+    resolve=None,
+    skill_view=None,
+    adapters=None,
+    delivery_context=None,
+):
     """Drive run_job with the standard cron-test seams patched.
 
     Returns (success, output, final_response, error, agent_constructed).
@@ -102,7 +110,11 @@ def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            success, output, final_response, error = run_job(job)
+            success, output, final_response, error = run_job(
+                job,
+                adapters=adapters,
+                delivery_context=delivery_context,
+            )
         agent_constructed = mock_agent_cls.called
     return success, output, final_response, error, agent_constructed
 
@@ -315,6 +327,164 @@ class TestSkillReadiness:
 
 
 class TestDeliveryPlatform:
+    def test_builder_route_allows_shared_live_adapter(self, tmp_path):
+        """A named profile may reuse Default's adapter for its own route."""
+        from gateway.config import GatewayConfig, Platform
+        from gateway.profile_routing import ProfileRoute
+
+        job = _job(deliver="discord:BUILDER")
+        config = GatewayConfig(platforms={})
+        delivery_context = sched.CronDeliveryContext(
+            profile_name="builder",
+            profile_routes=(
+                ProfileRoute(
+                    name="Builder",
+                    platform="discord",
+                    chat_id="BUILDER",
+                    profile="builder",
+                ),
+            ),
+        )
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config", return_value=config):
+                success, _output, _final, error, agent_constructed = (
+                    _run_job_patched(
+                        job,
+                        tmp_path,
+                        adapters={Platform.DISCORD: MagicMock()},
+                        delivery_context=delivery_context,
+                    )
+                )
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+    def test_builder_profile_rejects_shared_adapter_for_gga_route(self, tmp_path):
+        """A sibling route must not grant Builder Default's credentials."""
+        from gateway.config import GatewayConfig, Platform
+        from gateway.profile_routing import ProfileRoute
+
+        job = _job(deliver="discord:GGA")
+        config = GatewayConfig(platforms={})
+        delivery_context = sched.CronDeliveryContext(
+            profile_name="builder",
+            profile_routes=(
+                ProfileRoute(
+                    name="Builder",
+                    platform="discord",
+                    chat_id="BUILDER",
+                    profile="builder",
+                ),
+                ProfileRoute(
+                    name="GGA",
+                    platform="discord",
+                    chat_id="GGA",
+                    profile="gga",
+                ),
+            ),
+        )
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config", return_value=config):
+                success, output, _final, error, agent_constructed = (
+                    _run_job_patched(
+                        job,
+                        tmp_path,
+                        adapters={Platform.DISCORD: MagicMock()},
+                        delivery_context=delivery_context,
+                    )
+                )
+
+        assert success is False
+        assert agent_constructed is False
+        assert error is not None and "[blocked_config]" in error
+        assert "discord" in f"{error} {output}"
+
+    def test_more_specific_gga_thread_route_overrides_builder_channel(self, tmp_path):
+        """Builder's channel route must not capture a thread routed to GGA."""
+        from gateway.config import GatewayConfig, Platform
+        from gateway.profile_routing import parse_profile_routes
+
+        job = _job(deliver="discord:SHARED:TOPIC")
+        config = GatewayConfig(platforms={})
+        routes = parse_profile_routes(
+            [
+                {
+                    "name": "Builder",
+                    "platform": "discord",
+                    "chat_id": "SHARED",
+                    "profile": "builder",
+                },
+                {
+                    "name": "GGA topic",
+                    "platform": "discord",
+                    "chat_id": "SHARED",
+                    "thread_id": "TOPIC",
+                    "profile": "gga",
+                },
+            ]
+        )
+        delivery_context = sched.CronDeliveryContext(
+            profile_name="builder",
+            profile_routes=tuple(routes),
+        )
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config", return_value=config):
+                success, _output, _final, error, agent_constructed = (
+                    _run_job_patched(
+                        job,
+                        tmp_path,
+                        adapters={Platform.DISCORD: MagicMock()},
+                        delivery_context=delivery_context,
+                    )
+                )
+
+        assert success is False
+        assert agent_constructed is False
+        assert error is not None and "[blocked_config]" in error
+
+    def test_default_live_adapter_path_is_unchanged(self, tmp_path):
+        """The normal Default gateway path still trusts its live adapter."""
+        from gateway.config import GatewayConfig, Platform
+
+        job = _job(deliver="discord:GGA")
+        config = GatewayConfig(platforms={})
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config", return_value=config):
+                success, _output, _final, error, agent_constructed = (
+                    _run_job_patched(
+                        job,
+                        tmp_path,
+                        adapters={Platform.DISCORD: MagicMock()},
+                    )
+                )
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+    def test_standalone_still_blocks_without_profile_credentials(self, tmp_path):
+        """Manual execution has no live adapter and keeps credential checks."""
+        from gateway.config import GatewayConfig
+
+        job = _job(deliver="discord:CHANNEL")
+        config = GatewayConfig(platforms={})
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config", return_value=config):
+                success, output, _final, error, agent_constructed = (
+                    _run_job_patched(job, tmp_path)
+                )
+
+        assert success is False
+        assert agent_constructed is False
+        assert error is not None and "[blocked_config]" in error
+        assert "discord" in f"{error} {output}"
+
     def test_unknown_delivery_platform_blocks(self, tmp_path):
         job = _job(deliver="notaplatform")
         with cron_jobs.use_cron_store(tmp_path):
