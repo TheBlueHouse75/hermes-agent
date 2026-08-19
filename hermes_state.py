@@ -4955,6 +4955,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _is_sqlite_returned_null(exc: SystemError) -> bool:
+            return "returned null without setting an exception" in str(exc).lower()
+
         while True:
             try:
                 with self._lock:
@@ -4993,6 +4996,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                 if self._sleep_before_write_retry(
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
+                ):
+                    continue
+                raise
+            except SystemError as exc:
+                if (
+                    _is_sqlite_returned_null(exc)
+                    and self._sleep_before_write_retry(deadline, patience_s)
                 ):
                     continue
                 raise
