@@ -15389,10 +15389,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return _handler
 
     def _make_default_profile_message_handler(self):
-        """Scope a multiplexed default-profile message from ingress onward."""
-        profile_home = Path(get_hermes_home())
+        """Scope a primary-adapter message to its routed multiplex profile."""
+        default_profile_home = Path(get_hermes_home())
 
         async def _handler(event):
+            profile_home = default_profile_home
+            if getattr(event.source, "profile", None):
+                profile_home = self._resolve_profile_home_for_source(event.source)
             with _profile_runtime_scope(profile_home):
                 return await self._handle_message(event)
 

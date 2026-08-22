@@ -14,9 +14,12 @@ this suite locks the complementary primary-path fixes:
 """
 from __future__ import annotations
 
+import asyncio
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -212,6 +215,39 @@ class TestPrimaryMessageRuntimeScope:
         assert await handler(SimpleNamespace(source=SimpleNamespace(profile=None))) is True
         with pytest.raises(secret_scope.UnscopedSecretError):
             secret_scope.get_secret("DISCORD_BOT_TOKEN")
+
+    def test_primary_handler_uses_routed_profile_scope(self, tmp_path):
+        """A primary adapter may carry a source routed to a named profile.
+
+        The handler must resolve that source instead of pinning every primary
+        message to the gateway's default home; otherwise the named profile's
+        transcript is written correctly but reloaded from the root state.db.
+        """
+        from gateway import run as run_mod
+        from gateway.run import GatewayRunner
+
+        profile_home = tmp_path / "profiles" / "builder"
+        source = SimpleNamespace(profile="builder")
+        event = SimpleNamespace(source=source)
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = MagicMock(return_value=profile_home)
+
+        async def _handle_message(_event):
+            return "handled"
+
+        runner._handle_message = _handle_message  # type: ignore[method-assign]
+        scope = MagicMock(return_value=nullcontext())
+
+        with patch.object(run_mod, "_profile_runtime_scope", scope):
+            result = asyncio.run(
+                runner._primary_message_handler()(cast(Any, event))
+            )
+
+        assert result == "handled"
+        runner._resolve_profile_home_for_source.assert_called_once_with(source)
+        scope.assert_called_once_with(profile_home)
 
 
 class TestReconnectDropsEmptyToken:
