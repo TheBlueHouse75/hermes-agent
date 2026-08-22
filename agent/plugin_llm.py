@@ -1055,22 +1055,14 @@ class PluginLlm:
     def _json_response_format(
         *, json_mode: bool, json_schema: Optional[Any]
     ) -> Optional[Dict[str, Any]]:
-        """Build the ``extra_body.response_format`` payload for the
-        provider request. Falls back to ``json_object`` when no schema
-        is given so providers that ignore json_schema still get a hint."""
-        if json_schema is not None:
-            return {
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "plugin_structured_output",
-                        "schema": json_schema,
-                        "strict": False,
-                    },
-                }
-            }
-        if json_mode:
-            return {"response_format": {"type": "json_object"}}
+        """Return ``None`` — JSON is shaped via the prompt, not ``response_format``.
+
+        Local model servers (mlx-vlm with MTP draft, rapid-mlx, Ollama, etc.)
+        reject ``response_format`` outright when speculative decoding is
+        active, and many ignore it anyway. The prompt already carries the
+        directive (see :func:`_build_structured_messages`), so sending
+        ``response_format`` only adds a 500 failure mode with no upside.
+        """
         return None
 
     def _invoke_sync(
