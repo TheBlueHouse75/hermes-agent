@@ -150,6 +150,7 @@ from gateway.platforms.base import (
 )
 # Re-exported here for existing imports and constructor monkeypatches.
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from gateway.platforms.tcp_site import start_tcp_site
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -7979,23 +7980,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # Bind directly instead of probing 127.0.0.1 first — the old
             # single-family pre-probe raced the real bind and reported a
             # TIME_WAIT socket as "in use" (#10297), failing gateway
-            # restarts for up to ~60s.
-            #
-            # SO_REUSEADDR is platform-dependent (same rationale as the
-            # webhook adapter, #65482):
-            #   - macOS (BSD semantics): two sockets with SO_REUSEADDR can
-            #     silently split traffic while both report success — disable.
-            #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT
-            #     (a second live listener needs SO_REUSEPORT, never set), so
-            #     keep the default (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner,
-                self._host,
-                self._port,
-                reuse_address=False if sys.platform == "darwin" else None,
-            )
+            # restarts for up to ~60s. Platform-dependent SO_REUSEADDR and
+            # the TIME_WAIT retry live in start_tcp_site.
             try:
-                await self._site.start()
+                self._site = await start_tcp_site(self._runner, self._host, self._port, log_tag=self.name)
             except OSError as exc:
                 await self._runner.cleanup()
                 self._runner = None

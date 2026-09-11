@@ -39,7 +39,6 @@ import json
 import logging
 import re
 import subprocess
-import sys
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -60,6 +59,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.tcp_site import start_tcp_site
 from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,
@@ -303,24 +303,10 @@ class WebhookAdapter(BasePlatformAdapter):
         await self._runner.setup()
         # Do not probe only one address family before binding. With the
         # dual-stack default, an IPv6-only listener can already own this port
-        # while 127.0.0.1 still looks free.
-        #
-        # SO_REUSEADDR is platform-dependent:
-        #   - macOS (BSD semantics): two wildcard/specific sockets with
-        #     SO_REUSEADDR can silently split traffic while both servers
-        #     report success — so disable it there.
-        #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT
-        #     (a second live listener needs SO_REUSEPORT, which we never
-        #     set). Disabling it would make a quick gateway restart fail
-        #     to bind for up to ~60s — so keep the default (enabled).
-        site = web.TCPSite(
-            self._runner,
-            self._host,
-            self._port,
-            reuse_address=False if sys.platform == "darwin" else None,
-        )
+        # while 127.0.0.1 still looks free. Platform-dependent SO_REUSEADDR
+        # and the TIME_WAIT retry live in start_tcp_site.
         try:
-            await site.start()
+            await start_tcp_site(self._runner, self._host, self._port, log_tag="webhook")
         except OSError as exc:
             await self._runner.cleanup()
             self._runner = None
