@@ -301,27 +301,35 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             from hermes_cli.profiles import profiles_to_serve
 
             profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
-                start_kwargs["profile_homes"] = profile_homes
-                # Stand down, per tick, for any profile whose OWN gateway is
-                # running: that gateway ticks it with live adapters, and the
-                # tick-lock race otherwise lets this adapter-less ticker win
-                # and deliver the job through the standalone path (#100489).
-                # Evaluated every cycle so a gateway starting/stopping later
-                # is picked up without a dashboard restart.
-                from hermes_cli.profiles import _check_gateway_running
-
-                start_kwargs["profile_gate"] = (
-                    lambda _name, home: not _check_gateway_running(Path(home))
+            if profile_homes:
+                multiplex_kwargs: dict = {"profile_homes": profile_homes}
+                # Stand down, per tick, for any profile whose OWN gateway or
+                # multiplex gateway is running: that gateway ticks it with
+                # live adapters, and the tick-lock race otherwise lets this
+                # adapter-less ticker win and deliver through the standalone
+                # path (#100489). Evaluated every cycle so a gateway starting
+                # or stopping later is picked up without a dashboard restart.
+                from hermes_cli.profiles import (
+                    _check_gateway_running,
+                    _served_by_running_multiplexer,
                 )
-                from hermes_logging import enable_profile_log_routing
 
-                enable_profile_log_routing(profile_homes)
-                _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
+                multiplex_kwargs["profile_gate"] = (
+                    lambda name, home: not (
+                        _check_gateway_running(Path(home))
+                        or _served_by_running_multiplexer(name)
+                    )
                 )
+                if len(profile_homes) > 1:
+                    from hermes_logging import enable_profile_log_routing
+
+                    enable_profile_log_routing(profile_homes)
+                    _log.info(
+                        "Desktop cron scheduler will tick %d profile(s): %s",
+                        len(profile_homes),
+                        [name for name, _home in profile_homes],
+                    )
+                start_kwargs.update(multiplex_kwargs)
         except Exception:
             # Fail open to the single-store ticker — the active profile's
             # jobs must keep firing even if profile enumeration breaks.
@@ -329,6 +337,19 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
     provider.start(stop_event, **start_kwargs)
+
+
+def _desktop_backend_owns_cron_ticker() -> bool:
+    """Return whether this Desktop backend is the long-lived primary."""
+    marker = os.getenv("HERMES_DESKTOP_CRON_OWNER")
+    if marker is not None:
+        return marker == "1"
+
+    # Backward compatibility for older Desktop builds that do not pass the
+    # explicit ownership marker.
+    from hermes_cli.profiles import get_active_profile_name
+
+    return get_active_profile_name() in ("default", "custom")
 
 
 # Desktop `serve` only (start_server(start_mcp_discovery_after_bind=True)):
@@ -480,7 +501,10 @@ async def _lifespan(app: "FastAPI"):
     # dashboard` is unaffected — it relies on its own gateway.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
-    if os.getenv("HERMES_DESKTOP") == "1":
+    if (
+        os.getenv("HERMES_DESKTOP") == "1"
+        and _desktop_backend_owns_cron_ticker()
+    ):
         # Before forking a fresh gateway, reap any orphan left by a previous
         # serve session. Graceful shutdown reaps the managed child, but an
         # abnormal exit (crash, SIGKILL, power loss, forced update) reparents
