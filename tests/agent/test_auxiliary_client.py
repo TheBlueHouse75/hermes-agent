@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -26,6 +27,7 @@ from agent.auxiliary_client import (
     _is_rate_limit_error,
     _is_model_not_found_error,
     _is_model_incompatible_error,
+    _is_statusless_structured_provider_error,
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
     _try_payment_fallback,
@@ -1627,6 +1629,235 @@ class TestCallLlmPaymentFallback:
         exc.status_code = 429
         return exc
 
+    def _make_statusless_structured_error(
+        self,
+        *,
+        error_type="server_error",
+        error_code="overloaded",
+        error_payload=None,
+    ):
+        import httpx
+        from openai import APIError
+
+        if error_payload is None:
+            error_payload = {
+                "message": "Upstream service temporarily overloaded.",
+                "type": error_type,
+                "code": error_code,
+            }
+        return APIError(
+            "Upstream service temporarily overloaded.",
+            request=httpx.Request("POST", "https://relay.example/v1/chat/completions"),
+            body={"error": error_payload},
+        )
+
+    def test_structured_statusless_provider_error_is_detected(self):
+        assert _is_statusless_structured_provider_error(self._make_statusless_structured_error()) is True
+        assert _is_statusless_structured_provider_error(
+            self._make_statusless_structured_error(
+                error_type="stream_error",
+                error_code="mid_stream_failure",
+            )
+        ) is True
+        assert _is_statusless_structured_provider_error(
+            self._make_statusless_structured_error(error_payload="service unavailable")
+        ) is True
+        assert _is_statusless_structured_provider_error(
+            self._make_statusless_structured_error(error_payload="")
+        ) is False
+
+        message_only = Exception("stream_error: mid_stream_failure")
+        assert _is_statusless_structured_provider_error(message_only) is False
+
+        class _StatusCodedStructuredError(Exception):
+            status_code = 503
+            body = {"error": {"type": "server_error"}}
+
+        assert _is_statusless_structured_provider_error(_StatusCodedStructuredError("unavailable")) is False
+
+    @pytest.mark.parametrize(
+        "error_payload",
+        [{"type": "server_error", "code": "overloaded"}, "service unavailable"],
+    )
+    def test_statusless_structured_error_triggers_configured_fallback(self, error_payload):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://relay.example/v1"
+        primary_client.chat.completions.create.side_effect = self._make_statusless_structured_error(
+            error_payload=error_payload
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback response")
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "virtual-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "virtual-model", "https://relay.example/v1", "test-key", None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "fallback-model", "fallback_chain[0](openrouter)"),
+        ) as mock_chain, patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback",
+            return_value=(None, None, ""),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "fallback response"
+        assert primary_client.chat.completions.create.call_count == 1
+        assert mock_chain.call_args.kwargs["reason"] == "structured provider error"
+
+    @pytest.mark.parametrize(
+        "error_payload",
+        [{"type": "server_error", "code": "overloaded"}, "service unavailable"],
+    )
+    def test_async_statusless_structured_error_triggers_configured_fallback(self, error_payload):
+        import asyncio
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://relay.example/v1"
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_statusless_structured_error(error_payload=error_payload)
+        )
+
+        fallback_sync = MagicMock()
+        fallback_async = MagicMock()
+        fallback_async.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async fallback response")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "virtual-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "virtual-model", "https://relay.example/v1", "test-key", None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_sync, "fallback-model", "fallback_chain[0](openrouter)"),
+        ) as mock_chain, patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback",
+            return_value=(None, None, ""),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(fallback_async, "fallback-model"),
+        ):
+            result = asyncio.run(
+                async_call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+            )
+
+        assert result.choices[0].message.content == "async fallback response"
+        assert primary_client.chat.completions.create.await_count == 1
+        assert mock_chain.call_args.kwargs["reason"] == "structured provider error"
+
+    @staticmethod
+    def _parameter_retry_case(kind: str) -> tuple[Exception, dict[str, Any]]:
+        class _UnsupportedParameterError(Exception):
+            status_code = 400
+
+        first_error = _UnsupportedParameterError(f"Unsupported parameter: {kind}")
+        if kind == "temperature":
+            return first_error, {"temperature": 0.1}
+        if kind == "response_format":
+            return first_error, {"extra_body": {"response_format": {"type": "json_object"}}}
+        return first_error, {"max_tokens": 128}
+
+    @pytest.mark.parametrize("kind", ["temperature", "response_format", "max_tokens"])
+    @pytest.mark.parametrize(
+        "error_payload",
+        [{"type": "server_error", "code": "overloaded"}, "service unavailable"],
+    )
+    def test_parameter_retry_structured_error_reaches_fallback(self, kind, error_payload):
+        first_error, call_kwargs = self._parameter_retry_case(kind)
+        primary_client = MagicMock()
+        primary_client.base_url = "https://relay.example/v1"
+        primary_client.chat.completions.create.side_effect = [
+            first_error,
+            self._make_statusless_structured_error(error_payload=error_payload),
+        ]
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse("retry fallback")
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "virtual-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "virtual-model", "https://relay.example/v1", "test-key", None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "fallback-model", "fallback_chain[0](openrouter)"),
+        ) as mock_chain, patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback",
+            return_value=(None, None, ""),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                **call_kwargs,
+            )
+
+        assert result.choices[0].message.content == "retry fallback"
+        assert primary_client.chat.completions.create.call_count == 2
+        assert mock_chain.call_args.kwargs["reason"] == "structured provider error"
+
+    @pytest.mark.parametrize("kind", ["temperature", "response_format", "max_tokens"])
+    @pytest.mark.parametrize(
+        "error_payload",
+        [{"type": "server_error", "code": "overloaded"}, "service unavailable"],
+    )
+    def test_async_parameter_retry_structured_error_reaches_fallback(self, kind, error_payload):
+        import asyncio
+
+        first_error, call_kwargs = self._parameter_retry_case(kind)
+        primary_client = MagicMock()
+        primary_client.base_url = "https://relay.example/v1"
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                first_error,
+                self._make_statusless_structured_error(error_payload=error_payload),
+            ]
+        )
+        fallback_sync = MagicMock()
+        fallback_async = MagicMock()
+        fallback_async.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async retry fallback")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "virtual-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "virtual-model", "https://relay.example/v1", "test-key", None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_sync, "fallback-model", "fallback_chain[0](openrouter)"),
+        ) as mock_chain, patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback",
+            return_value=(None, None, ""),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(fallback_async, "fallback-model"),
+        ):
+            result = asyncio.run(
+                async_call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                    **call_kwargs,
+                )
+            )
+
+        assert result.choices[0].message.content == "async retry fallback"
+        assert primary_client.chat.completions.create.await_count == 2
+        assert mock_chain.call_args.kwargs["reason"] == "structured provider error"
 
     def test_429_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit errors should trigger fallback to next provider."""
