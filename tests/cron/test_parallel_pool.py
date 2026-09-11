@@ -131,7 +131,15 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        assert claim_calls == [
+            (
+                "queued-job",
+                {
+                    "return_job": True,
+                    "expected_next_run_at": "2020-01-01T00:00:00",
+                },
+            )
+        ]
         assert "queued-job" not in sched._running_job_ids
 
 
@@ -170,7 +178,6 @@ class TestRunningJobGuard:
             return {"id": f"{job_id}-execution"}
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [failing_job, healthy_job])
-        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
         monkeypatch.setattr(sched, "create_execution", create_execution_side_effect)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: called.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
@@ -357,13 +364,10 @@ class TestWorkdirParallelPool:
         sched._running_job_ids.discard("guard-seq")
         sched._shutdown_parallel_pool()
 
-class TestTickBatchAdvance:
-    """The tick's pre-dispatch advance must go through advance_next_runs
-    exactly once with the whole due set — a revert to the per-job loop
-    (or back to advance_next_run) must fail this test, not slip past the
-    helper-level I/O pin."""
+class TestTickClaimAdvance:
+    """The ticker advances recurring slots only through the durable CAS."""
 
-    def test_tick_calls_advance_next_runs_once_with_all_due_ids(self, tmp_path, monkeypatch):
+    def test_tick_claims_each_due_job_before_running_it(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
         sched._parallel_pool = None
@@ -377,11 +381,13 @@ class TestTickBatchAdvance:
             for i in range(4)
         ]
 
-        advance_calls = []
+        claim_calls = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(
-            sched, "advance_next_runs",
-            lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
+            sched,
+            "claim_job_for_fire",
+            lambda job_id, **_kwargs: claim_calls.append(job_id) or True,
+        )
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -390,7 +396,6 @@ class TestTickBatchAdvance:
         n = sched.tick(verbose=False)
 
         assert n == 4
-        assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
-            f"tick must batch-advance the due set in ONE call; got {advance_calls}")
+        assert sorted(claim_calls) == [f"job-{i}" for i in range(4)]
 
         sched._shutdown_parallel_pool()

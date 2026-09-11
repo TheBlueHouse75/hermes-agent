@@ -853,26 +853,29 @@ class TestGetDueJobs:
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
 
-    def test_stale_past_due_runs_once_and_fast_forwards(self, tmp_cron_dir):
-        """Recurring jobs past their grace window run once now and fast-forward next_run_at.
-
-        For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
-        The job should be returned as due (execute once) with next_run_at in the future.
-        """
+    def test_stale_past_due_advances_only_after_fire_claim(self, tmp_cron_dir):
+        """A stale recurring slot remains retryable until its fire claim succeeds."""
         job = create_job(prompt="Stale", schedule="every 1h")
-        # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
         jobs = load_jobs()
-        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        stale = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["next_run_at"] = stale
         save_jobs(jobs)
 
         due = get_due_jobs()
-        # Job is returned as due — execute once now instead of skipping
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
-        # next_run_at should be fast-forwarded to the future (accumulated slots skipped)
-        updated = get_job(job["id"])
+        persisted = get_job(job["id"])
+        assert persisted is not None
+        assert persisted["next_run_at"] == stale
+
+        claimed = claim_job_for_fire(
+            job["id"],
+            expected_next_run_at=due[0]["next_run_at"],
+            return_job=True,
+        )
+        assert isinstance(claimed, dict)
         from cron.jobs import _ensure_aware, _hermes_now
-        next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        next_dt = _ensure_aware(datetime.fromisoformat(claimed["next_run_at"]))
         assert next_dt > _hermes_now()
 
 
@@ -911,28 +914,29 @@ class TestGetDueJobs:
         assert any(d.get("id") == healthy["id"] for d in due)
 
 
-    def test_long_execution_does_not_perpetually_defer(self, tmp_cron_dir, monkeypatch):
-        """#33315: a recurring job whose runtime exceeds interval+grace must still
-        run once when the tick comes back, not skip forever.
-
-        Reproduces the production loop: a 5-min interval job whose previous run
-        overran the interval, leaving next_run_at ~11 min in the past — beyond
-        the 150s grace for a 5m interval. The job must be returned as due (run
-        once) AND have next_run_at fast-forwarded (so accumulated missed slots
-        don't all fire)."""
+    def test_long_execution_remains_retryable_until_claim(self, tmp_cron_dir, monkeypatch):
+        """A long-running recurrence is returned once without pre-consuming its slot."""
         from cron.jobs import _ensure_aware, _hermes_now
         job = create_job(prompt="Long job", schedule="every 5m")
         jobs = load_jobs()
-        # 11 minutes ago: > grace (150s for a 5m interval) — the "still running" miss.
         stale = (_hermes_now() - timedelta(minutes=11)).isoformat()
         jobs[0]["next_run_at"] = stale
         jobs[0]["last_run_at"] = (_hermes_now() - timedelta(minutes=1)).isoformat()
         save_jobs(jobs)
 
         due = get_due_jobs()
-        assert [j["id"] for j in due] == [job["id"]], "long-execution job was skipped (perpetual-defer bug)"
-        # next_run_at fast-forwarded into the future (no burst of missed slots).
-        nxt = _ensure_aware(datetime.fromisoformat(get_job(job["id"])["next_run_at"]))
+        assert [j["id"] for j in due] == [job["id"]], "long-execution job was skipped"
+        persisted = get_job(job["id"])
+        assert persisted is not None
+        assert persisted["next_run_at"] == stale
+
+        claimed = claim_job_for_fire(
+            job["id"],
+            expected_next_run_at=due[0]["next_run_at"],
+            return_job=True,
+        )
+        assert isinstance(claimed, dict)
+        nxt = _ensure_aware(datetime.fromisoformat(claimed["next_run_at"]))
         assert nxt > _hermes_now()
 
 

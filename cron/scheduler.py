@@ -713,7 +713,6 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 
 from cron.jobs import (
     _ensure_cron_dir,
-    advance_next_runs,
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
@@ -722,6 +721,8 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
+    record_catch_up_occurrence,
+    rollback_fire_claim_for_retry,
     save_job_output,
     use_cron_store,
 )
@@ -3382,14 +3383,27 @@ def _deliver_result(
 
         from gateway.delivery import resolve_delivery_transport
 
-        target_adapters = adapters
+        target_adapters: Any = adapters
         if isinstance(adapters, SharedRouteAdapters):
             # Credentialless satellite: the primary adapter is a valid
             # transport for THIS target only when an exact primary route maps
-            # it to this profile (#101113). Miss → fail closed below.
+            # it to this profile (#101113). A miss must not escape into the
+            # satellite's standalone transport, even if ambient native config
+            # happens to be present.
             shared = adapters.get(platform, target)
-            target_adapters = {platform: shared} if shared is not None else {}
+            if shared is None:
+                msg = (
+                    f"target {platform_name}:{chat_id} is outside the authorized "
+                    "scope of shared routes"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            target_adapters = {platform: shared}
         transport = resolve_delivery_transport(platform, config, target_adapters)
+        exclusive_live_transport = transport is not None and (
+            transport.is_relay or isinstance(adapters, SharedRouteAdapters)
+        )
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -3417,14 +3431,13 @@ def _deliver_result(
             pconfig = config.platforms.get(platform)
             runtime_adapter = None
 
-        if transport is not None and transport.is_relay:
-            # A relay transport carries the RELAY adapter's config, and
-            # resolve_delivery_transport already applied relay's enablement
-            # rule (config block absent OR enabled). The logical platform is
-            # deliberately NOT natively enabled in a relay-fronted deployment
-            # (its credential lives in the connector), so the native
-            # configured/enabled gate below must not apply — it used to
-            # reject exactly the targets the relay was resolved to serve.
+        if exclusive_live_transport:
+            # Relay-fronted platforms and credentialless satellites both use a
+            # live transport whose credential/config belongs elsewhere. The
+            # resolver already applied the transport enablement rule; for a
+            # satellite, SharedRouteAdapters additionally proved that this
+            # exact target is routed to the active profile. Do not re-apply the
+            # satellite's intentionally absent native platform config below.
             if pconfig is None:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(enabled=True)
@@ -3577,6 +3590,22 @@ def _deliver_result(
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
 
+        if isinstance(adapters, SharedRouteAdapters) and runtime_adapter is not None:
+            # Surface selection may have changed the effective thread after the
+            # initial exact-route lookup. Revalidate the final destination so a
+            # thread-scoped profile route can never be flattened into its parent
+            # channel (or otherwise widened) after authorization.
+            effective_target = dict(target)
+            effective_target["thread_id"] = thread_id
+            if adapters.get(platform, effective_target) is not runtime_adapter:
+                msg = (
+                    f"shared-route destination changed outside the authorized "
+                    f"scope for {platform_name}:{chat_id}"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+
         if live_adapter_ready:
             # Telegram topic routing (#22773, regression fixed #52060): a
             # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is
@@ -3711,42 +3740,43 @@ def _deliver_result(
                         except TimeoutError:
                             # #38922: a slow confirmation does NOT necessarily
                             # mean the send failed — but we must distinguish two
-                            # cases via future.cancel()'s return value:
+                            # cases via future.done():
                             #
-                            #   cancel() == False -> the coroutine was already
-                            #     running on the gateway loop when the timeout
-                            #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
-                            #
-                            #   cancel() == True -> the scheduled callback never
-                            #     started executing (loop wedged/backlogged for
-                            #     the full 60s), so nothing was sent.  We MUST
-                            #     fall through to the standalone path or the
-                            #     message is silently dropped (worse than a
-                            #     duplicate).
-                            cancelled = future.cancel()
-                            if cancelled:
-                                msg = (
-                                    f"live adapter send to {platform_name}:{chat_id} "
-                                    "timed out before the coroutine was dispatched"
-                                )
-                                logger.warning(
-                                    "Job '%s': %s, falling back to standalone",
-                                    job["id"], msg,
-                                )
-                                target_errors.append(msg)
-                                adapter_ok = False  # fall through to standalone path
-                                timeout_handled = True
+                            #   done() == True -> the adapter itself raised
+                            #     TimeoutError; this is a terminal failure.
+                            #   done() == False -> confirmation timed out. Calling
+                            #     cancel() cannot prove the coroutine never began;
+                            #     it may return true after the adapter already
+                            #     performed its external send. Treat the outcome as
+                            #     unverified and never retry through standalone.
+                            if future.done():
+                                # The future may have completed successfully in
+                                # the race between result(timeout=...) raising
+                                # and this observation. Read it again before
+                                # deciding whether a confirmed failure may use
+                                # the standalone fallback.
+                                try:
+                                    send_result = future.result()
+                                    timeout_handled = False
+                                except Exception as completed_error:
+                                    msg = (
+                                        f"live adapter send to {platform_name}:{chat_id} "
+                                        f"failed: {type(completed_error).__name__}: "
+                                        f"{completed_error}"
+                                    )
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    target_errors.append(msg)
+                                    adapter_ok = False
+                                    timeout_handled = True
                             else:
+                                future.cancel()
                                 timed_out = True
                                 timeout_handled = True
+                                unverified_targets.append(f"{platform_name}:{chat_id}")
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
-                                    "assuming delivered (skipping standalone fallback "
-                                    "to avoid duplicate)",
+                                    "after 60s; delivery state is unverified, skipping "
+                                    "standalone fallback to avoid a duplicate",
                                     job["id"], platform_name, chat_id,
                                 )
                         except Exception as ex:
@@ -3807,7 +3837,7 @@ def _deliver_result(
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                if exclusive_live_transport:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
@@ -3964,7 +3994,7 @@ def _deliver_result(
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                if transport is not None and transport.is_relay:
+                if exclusive_live_transport:
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
                     logger.warning(
@@ -3973,13 +4003,17 @@ def _deliver_result(
                     )
 
         if not delivered:
-            if transport is not None and transport.is_relay:
-                # Relay owns the logical destination and its connector owns the
-                # platform credential. A native retry could duplicate delivery
-                # and cannot be authenticated correctly, so fail closed.
+            if exclusive_live_transport:
+                # Relay and shared-route transports own the logical destination
+                # and sender identity. A standalone retry could duplicate a
+                # timed-out send or use the wrong credentials, so fail closed.
                 if not target_errors:
+                    transport_name = (
+                        "relay" if transport is not None and transport.is_relay
+                        else "shared-route"
+                    )
                     target_errors.append(
-                        f"relay delivery to {platform_name}:{chat_id} failed"
+                        f"{transport_name} delivery to {platform_name}:{chat_id} failed"
                     )
                 delivery_errors.extend(target_errors)
                 continue
@@ -7262,6 +7296,17 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                 exc_info=True,
             )
 
+    def _rollback_unstarted_claim() -> bool:
+        try:
+            return rollback_fire_claim_for_retry(job_id, expected_owner=owner)
+        except Exception:
+            logger.warning(
+                "Job '%s': unstarted fire-claim rollback failed",
+                job_id,
+                exc_info=True,
+            )
+            return False
+
     try:
         owns_fire_claim = heartbeat_fire_claim(job_id, expected_owner=owner)
     except Exception:
@@ -7273,6 +7318,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         _finish_unstarted(
             "Fire claim ownership could not be validated before execution started."
         )
+        _rollback_unstarted_claim()
         return True
 
     if owns_fire_claim is False:
@@ -7331,9 +7377,17 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         _finish_unstarted(
             "Fire claim heartbeat could not be started; execution was not run."
         )
+        if not _rollback_unstarted_claim():
+            logger.warning(
+                "Job '%s': could not roll back the unstarted fire claim; "
+                "leaving it fenced for stale-claim recovery",
+                job_id,
+            )
         return True
 
     try:
+        if isinstance(claim, dict) and claim.get("catch_up"):
+            record_catch_up_occurrence()
         return run(lost_ownership)
     finally:
         stop.set()
@@ -8319,18 +8373,6 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, the advance keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        # Batched: one load + one save for the whole due set, not one per job.
-        # Composes with the claim-time advance in claim_job_for_fire: for
-        # cron-kind jobs both compute the same next occurrence; interval jobs
-        # re-anchor from their own "now" at claim time (harmless for
-        # at-most-once — mark_job_run re-anchors at completion regardless).
-        advance_next_runs([job["id"] for job in due_jobs])
-
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
@@ -8366,7 +8408,11 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            claimed = claim_job_for_fire(
+                job["id"],
+                return_job=True,
+                expected_next_run_at=job.get("next_run_at"),
+            )
             if not claimed:
                 finish_execution(
                     job["execution_id"],

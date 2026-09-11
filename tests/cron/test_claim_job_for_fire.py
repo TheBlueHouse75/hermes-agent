@@ -9,6 +9,7 @@ E2E-over-mocks discipline for file-touching code.
 """
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -33,6 +34,86 @@ def test_claim_succeeds_once_then_blocks(temp_home):
     assert claim_job_for_fire(jid) is True
     assert claim_job_for_fire(jid) is False
     assert get_job(jid)["next_run_at"] != before
+
+
+def test_scheduled_claim_rejects_changed_occurrence(temp_home):
+    """A queued snapshot cannot claim a record rescheduled in the meantime."""
+    from cron.jobs import claim_job_for_fire, create_job, get_job, update_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="changed")
+    expected = job["next_run_at"]
+    replacement = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    update_job(job["id"], {"next_run_at": replacement})
+
+    assert claim_job_for_fire(
+        job["id"], expected_next_run_at=expected
+    ) is False
+    persisted = get_job(job["id"])
+    assert persisted is not None
+    assert persisted["next_run_at"] == replacement
+    assert persisted.get("fire_claim") is None
+
+
+def test_catch_up_is_marked_for_post_heartbeat_accounting(temp_home, monkeypatch):
+    from cron import jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="catch-up")
+    expected = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    jobs.update_job(job["id"], {"next_run_at": expected})
+    catch_ups = []
+    monkeypatch.setattr(jobs, "record_catch_up_occurrence", lambda: catch_ups.append(True))
+
+    claimed = jobs.claim_job_for_fire(
+        job["id"], return_job=True, expected_next_run_at=expected
+    )
+
+    assert isinstance(claimed, dict)
+    assert claimed["next_run_at"] != expected
+    assert claimed["fire_claim"]["catch_up"] is True
+    assert catch_ups == []
+
+
+def test_unstarted_claim_rollback_restores_recurring_occurrence(temp_home):
+    from cron import jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="rollback")
+    expected = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    jobs.update_job(job["id"], {"next_run_at": expected})
+    claimed = jobs.claim_job_for_fire(
+        job["id"], return_job=True, expected_next_run_at=expected
+    )
+    assert isinstance(claimed, dict)
+    owner = claimed["fire_claim"]["by"]
+
+    assert jobs.rollback_fire_claim_for_retry(
+        job["id"], expected_owner=owner
+    ) is True
+    restored = jobs.get_job(job["id"])
+    assert restored is not None
+    assert restored["next_run_at"] == expected
+    assert restored.get("fire_claim") is None
+
+
+def test_unstarted_claim_rollback_preserves_concurrent_reschedule(temp_home):
+    from cron import jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="rescheduled")
+    expected = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    jobs.update_job(job["id"], {"next_run_at": expected})
+    claimed = jobs.claim_job_for_fire(
+        job["id"], return_job=True, expected_next_run_at=expected
+    )
+    assert isinstance(claimed, dict)
+    owner = claimed["fire_claim"]["by"]
+    replacement = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    jobs.update_job(job["id"], {"next_run_at": replacement})
+
+    assert jobs.rollback_fire_claim_for_retry(
+        job["id"], expected_owner=owner
+    ) is False
+    preserved = jobs.get_job(job["id"])
+    assert preserved is not None
+    assert preserved["next_run_at"] == replacement
 
 
 def test_claim_oneshot_cannot_be_double_claimed(temp_home):

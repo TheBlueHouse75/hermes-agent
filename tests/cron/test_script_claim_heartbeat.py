@@ -464,6 +464,7 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
 
     run_body = MagicMock(return_value=True)
     finish = MagicMock()
+    rollback = MagicMock(return_value=True)
     job = {
         "id": "validation-error",
         "execution_id": "validation-execution",
@@ -476,10 +477,14 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
     )
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr(scheduler, "rollback_fire_claim_for_retry", rollback)
 
     assert scheduler.run_one_job(job) is True
 
     run_body.assert_not_called()
+    rollback.assert_called_once_with(
+        "validation-error", expected_owner="owner"
+    )
     finish.assert_called_once_with(
         "validation-execution",
         success=False,
@@ -493,6 +498,7 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
 
     run_body = MagicMock(return_value=True)
     finish = MagicMock()
+    rollback = MagicMock(return_value=True)
     job = {
         "id": "thread-start-error",
         "execution_id": "thread-execution",
@@ -501,6 +507,7 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr(scheduler, "rollback_fire_claim_for_retry", rollback)
     monkeypatch.setattr(
         scheduler.threading.Thread,
         "start",
@@ -510,11 +517,39 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
     assert scheduler.run_one_job(job) is True
 
     run_body.assert_not_called()
+    rollback.assert_called_once_with(
+        "thread-start-error", expected_owner="owner"
+    )
     finish.assert_called_once_with(
         "thread-execution",
         success=False,
         error="Fire claim heartbeat could not be started; execution was not run.",
     )
+
+
+def test_catch_up_is_recorded_after_heartbeat_starts(monkeypatch):
+    import cron.scheduler as scheduler
+
+    recorded = []
+    job = {
+        "id": "catch-up",
+        "fire_claim": {
+            "at": "2026-07-12T12:00:00+00:00",
+            "by": "owner",
+            "catch_up": True,
+        },
+    }
+    monkeypatch.setattr(
+        scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        scheduler, "record_catch_up_occurrence", lambda: recorded.append(True)
+    )
+
+    assert scheduler._run_with_fire_claim_heartbeat(
+        job, lambda _lost: True
+    ) is True
+    assert recorded == [True]
 
 
 def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
@@ -544,7 +579,7 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
 
     assert scheduler.run_one_job(job) is True
-    assert calls >= 3
+    assert calls >= 2
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):

@@ -10,6 +10,8 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import cron.scheduler as s
@@ -56,13 +58,54 @@ def test_tick_process_job_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j1", True)
 
 
-def test_tick_skips_job_when_durable_fire_claim_is_lost(monkeypatch):
-    """A manual/external fire that wins the shared CAS must exclude ticker."""
-    calls = _patch_pipeline(monkeypatch)
-    monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j1", "name": "t"}])
-    monkeypatch.setattr(s, "claim_job_for_fire", lambda _job_id: False)
+def test_tick_does_not_consume_slot_when_durable_fire_claim_is_lost(
+    tmp_path, monkeypatch
+):
+    """A lost CAS excludes the ticker without advancing the unclaimed slot."""
+    from cron.jobs import create_job, get_job, update_job
 
-    assert s.tick(verbose=False, sync=True) == 0
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = create_job(prompt="x", schedule="every 5m", name="t")
+    due_at = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    update_job(job["id"], {"next_run_at": due_at})
+
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(s, "create_execution", lambda *_a, **_kw: {"id": "exec"})
+    monkeypatch.setattr(s, "finish_execution", lambda *_a, **_kw: None)
+    monkeypatch.setattr(s, "claim_job_for_fire", lambda _job_id, **_kwargs: False)
+
+    assert s.tick(verbose=False, sync=True) == 1
+    assert calls == []
+    persisted = get_job(job["id"])
+    assert persisted is not None
+    assert persisted["next_run_at"] == due_at
+
+
+def test_tick_does_not_run_occurrence_rescheduled_after_due_scan(
+    tmp_path, monkeypatch
+):
+    """A queued due snapshot cannot fire after its schedule moved forward."""
+    from cron.jobs import claim_job_for_fire, create_job, get_due_jobs, update_job
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = create_job(prompt="x", schedule="every 5m", name="t")
+    due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    update_job(job["id"], {"next_run_at": due_at})
+    due_job = get_due_jobs()[0]
+    rescheduled_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(s, "get_due_jobs", lambda: [due_job])
+    monkeypatch.setattr(s, "create_execution", lambda *_a, **_kw: {"id": "exec"})
+    monkeypatch.setattr(s, "finish_execution", lambda *_a, **_kw: None)
+
+    def reschedule_then_claim(job_id, **kwargs):
+        update_job(job_id, {"next_run_at": rescheduled_at})
+        return claim_job_for_fire(job_id, **kwargs)
+
+    monkeypatch.setattr(s, "claim_job_for_fire", reschedule_then_claim)
+
+    assert s.tick(verbose=False, sync=True) == 1
     assert calls == []
 
 

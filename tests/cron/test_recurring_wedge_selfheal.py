@@ -77,6 +77,11 @@ class TestStaleInflightSelfHeal:
         env = cron_env
         monkeypatch.setattr(E, "EXECUTIONS_FILE", env["home"] / "cron" / "executions.db")
         monkeypatch.setattr(S, "_hermes_home", env["home"])
+        # These tests isolate the in-memory stale-running guard. The durable
+        # occurrence-CAS behavior has its own real-store coverage.
+        monkeypatch.setattr(
+            S, "claim_job_for_fire", lambda _job_id, **_kwargs: True
+        )
         return S, E, env
 
     def test_stale_claim_self_heals_and_redispatches(self, cron_env, monkeypatch):

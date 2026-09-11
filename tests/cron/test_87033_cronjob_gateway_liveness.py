@@ -25,21 +25,16 @@ import pytest
 
 @pytest.fixture
 def hermes_env(tmp_path, monkeypatch):
-    """Isolate HERMES_HOME for each test so jobs don't leak."""
+    """Isolate HERMES_HOME for each test so jobs don't leak.
+
+    Do not reload the shared scheduler modules here: later-collected tests may
+    hold class references from before the reload, which makes otherwise valid
+    ``isinstance`` checks fail only in the full suite.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "cron").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-
-    import importlib
-
-    import hermes_constants
-    importlib.reload(hermes_constants)
-    import cron.jobs
-    importlib.reload(cron.jobs)
-    import cron.scheduler
-    importlib.reload(cron.scheduler)
-
     return home
 
 

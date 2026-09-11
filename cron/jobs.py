@@ -3608,6 +3608,7 @@ def claim_job_for_fire(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    expected_next_run_at: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -3617,6 +3618,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            expected_next_run_at=expected_next_run_at,
         )
 
 
@@ -3626,6 +3628,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    expected_next_run_at: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -3663,6 +3666,11 @@ def _claim_job_for_fire_locked(
             # gate and atomically resumes the job below.
             if not force and not is_job_runnable(job):
                 return False
+            if (
+                expected_next_run_at is not None
+                and job.get("next_run_at") != expected_next_run_at
+            ):
+                return False
             now = _hermes_now()
             existing = job.get("fire_claim")
             if existing:
@@ -3688,15 +3696,71 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            occurrence_at = job.get("next_run_at")
+            fire_claim = {
+                "at": now.isoformat(),
+                "by": owner,
+                "occurrence_at": occurrence_at,
+            }
+            job["fire_claim"] = fire_claim
             kind = job.get("schedule", {}).get("kind")
+            is_catch_up = False
             if kind in {"cron", "interval"}:
+                if expected_next_run_at is not None:
+                    try:
+                        expected_dt = _ensure_aware(
+                            datetime.fromisoformat(expected_next_run_at)
+                        )
+                        is_catch_up = (
+                            now - expected_dt
+                        ).total_seconds() > _compute_grace_seconds(job["schedule"])
+                    except (TypeError, ValueError):
+                        pass
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
+                    fire_claim["advanced_to"] = nxt
+                if is_catch_up:
+                    fire_claim["catch_up"] = True
             save_jobs(jobs)
             return copy.deepcopy(job) if return_job else True
         return False
+
+
+def rollback_fire_claim_for_retry(job_id: str, *, expected_owner: str) -> bool:
+    """Undo an acquired claim when execution could not start.
+
+    The rollback is owner- and occurrence-fenced: a concurrent reschedule or
+    replacement claim is never overwritten.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                claim = job.get("fire_claim")
+                if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                    return False
+                kind = job.get("schedule", {}).get("kind")
+                if kind in {"cron", "interval"}:
+                    occurrence_at = claim.get("occurrence_at")
+                    advanced_to = claim.get("advanced_to")
+                    if (
+                        not isinstance(occurrence_at, str)
+                        or not isinstance(advanced_to, str)
+                        or job.get("next_run_at") != advanced_to
+                    ):
+                        return False
+                    job["next_run_at"] = occurrence_at
+                elif kind == "once":
+                    job["run_claim"] = None
+                job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
+    return False
 
 
 # Completed one-shot job records are retained in jobs.json (final status +
@@ -4239,21 +4303,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             grace,
                             new_next,
                         )
-                        # Persist the fast-forward to storage now (skip accumulated
-                        # slots). In the built-in ticker path this is shortly
-                        # overwritten by advance_next_run + mark_job_run, but it is
-                        # NOT redundant: it (a) protects the crash window between
-                        # here and mark_job_run, and (b) covers the external
-                        # fire_due provider path, which does not call
-                        # advance_next_run. mark_job_run re-anchors next_run_at off
-                        # the actual completion time, so this value is provisional.
-                        for rj in raw_jobs:
-                            if rj["id"] == job["id"]:
-                                rj["next_run_at"] = new_next
-                                needs_save = True
-                                break
-                        record_catch_up_occurrence()
-                        # Fall through to due.append(job) — execute once now
+                        # Keep the overdue occurrence intact until the durable
+                        # fire claim is acquired. The claim atomically advances
+                        # next_run_at and records the catch-up; if dispatch or the
+                        # claim fails, the same occurrence remains due for retry.
+                        # Fall through to due.append(job) — execute once now.
 
                 # One-shot grace gate: a one-shot whose persisted run time is
                 # beyond the grace window must never fire. create_job /

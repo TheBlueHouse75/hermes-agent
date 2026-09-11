@@ -15,6 +15,31 @@ import asyncio
 import threading
 from unittest.mock import patch
 
+import pytest
+
+
+def test_only_primary_desktop_backend_owns_multiplex_ticker(monkeypatch):
+    """The explicit Desktop marker is authoritative over profile names."""
+    from hermes_cli import web_server
+
+    monkeypatch.delenv("HERMES_DESKTOP_CRON_OWNER", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+    )
+    assert web_server._desktop_backend_owns_cron_ticker() is True
+
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "str")
+    assert web_server._desktop_backend_owns_cron_ticker() is False
+
+    monkeypatch.setenv("HERMES_DESKTOP_CRON_OWNER", "0")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+    )
+    assert web_server._desktop_backend_owns_cron_ticker() is False
+
+    monkeypatch.setenv("HERMES_DESKTOP_CRON_OWNER", "1")
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "str")
+    assert web_server._desktop_backend_owns_cron_ticker() is True
 
 
 def test_standalone_fallback_pool_keeps_profile_scope(tmp_path, monkeypatch):
@@ -105,16 +130,30 @@ def test_multiplex_ticker_profile_gate_skips_rejected_profile(tmp_path):
     assert (orphan / "cron" / "ticker_last_success").exists()
 
 
-def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch):
-    """The desktop ticker wires the gate to ``_check_gateway_running``."""
-    from hermes_cli import web_server
-
-    homes = [("default", tmp_path / "default"), ("ops", tmp_path / "ops")]
+@pytest.mark.parametrize(
+    ("gateway_kind", "profile_names", "gated_name"),
+    [
+        ("own", ["default", "ops"], "ops"),
+        ("multiplex", ["default", "ops"], "ops"),
+        ("own", ["default"], "default"),
+        ("multiplex", ["custom"], "custom"),
+    ],
+)
+def test_desktop_ticker_gates_on_running_gateway(
+    tmp_path, monkeypatch, gateway_kind, profile_names, gated_name
+):
+    """An own or multiplex gateway pre-empts the Desktop ticker."""
+    homes = [(name, tmp_path / name) for name in profile_names]
     monkeypatch.setattr(
         "hermes_cli.profiles.profiles_to_serve", lambda multiplex=False: list(homes)
     )
     monkeypatch.setattr(
-        "hermes_cli.profiles._check_gateway_running", lambda home: home.name == "ops"
+        "hermes_cli.profiles._check_gateway_running",
+        lambda home: gateway_kind == "own" and home.name == gated_name,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles._served_by_running_multiplexer",
+        lambda name: gateway_kind == "multiplex" and name == gated_name,
     )
     captured = {}
 
@@ -125,8 +164,8 @@ def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch):
             captured.update(kwargs)
 
     from cron import scheduler_provider as sp
+    from hermes_cli import web_server
 
-    monkeypatch.setattr(web_server, "resolve_cron_scheduler", lambda: _Provider(), raising=False)
     monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: _Provider())
     monkeypatch.setattr(sp, "InProcessCronScheduler", _Provider)
     monkeypatch.setattr("hermes_logging.enable_profile_log_routing", lambda homes: None)
@@ -135,5 +174,38 @@ def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch):
 
     gate = captured.get("profile_gate")
     assert gate is not None, "desktop ticker did not install a profile gate"
-    assert gate("default", tmp_path / "default") is True
-    assert gate("ops", tmp_path / "ops") is False
+    for name, home in homes:
+        assert gate(name, home) is (name != gated_name)
+
+
+def test_desktop_ticker_multiplex_setup_is_atomic(tmp_path, monkeypatch):
+    """Partial multiplex setup failure must fall back without profile_homes."""
+    homes = [("default", tmp_path / "default"), ("ops", tmp_path / "ops")]
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve", lambda multiplex=False: list(homes)
+    )
+    monkeypatch.setattr("hermes_cli.profiles._check_gateway_running", lambda home: False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._served_by_running_multiplexer", lambda name: False
+    )
+    monkeypatch.setattr(
+        "hermes_logging.enable_profile_log_routing",
+        lambda homes: (_ for _ in ()).throw(RuntimeError("routing failed")),
+    )
+    captured = {}
+
+    class _Provider:
+        name = "fake"
+
+        def start(self, stop_event, **kwargs):
+            captured.update(kwargs)
+
+    from cron import scheduler_provider as sp
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: _Provider())
+    monkeypatch.setattr(sp, "InProcessCronScheduler", _Provider)
+
+    web_server._start_desktop_cron_ticker(threading.Event(), interval=7)
+
+    assert captured == {"interval": 7}
