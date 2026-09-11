@@ -50,9 +50,12 @@ export interface BargeMonitorCallbacks {
    * the old behavior of a monitor opened at playback start.
    */
   isPlaying?: () => boolean
+  /** End a captured interruption after this much confirmed quiet. */
+  utteranceSilenceMs?: number
 }
 
 export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): () => void {
+  const utteranceSilenceMs = Math.max(300, callbacks.utteranceSilenceMs ?? UTTERANCE_SILENCE_MS)
   let disposed = false
   let stream: MediaStream | null = null
   let context: AudioContext | null = null
@@ -306,7 +309,7 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
             quietSince ??= now
           }
 
-          if ((quietSince && now - quietSince >= UTTERANCE_SILENCE_MS) || now - trippedAt >= UTTERANCE_MAX_MS) {
+          if ((quietSince && now - quietSince >= utteranceSilenceMs) || now - trippedAt >= UTTERANCE_MAX_MS) {
             finishCapture()
 
             return

@@ -157,7 +157,7 @@ Two-stage algorithm detects when you've finished speaking:
 
 If no speech is detected at all for 15 seconds, recording stops automatically.
 
-Both `silence_threshold` and `silence_duration` are configurable in `config.yaml`. You can also disable the record start/stop beeps with `voice.beep_enabled: false`.
+Both `silence_threshold` and `silence_duration` are configurable in `config.yaml`. Desktop voice conversations also use `voice.silence_duration` for normal turns and spoken interruptions; a sub-second value feels faster but can split deliberate pauses into separate turns. You can also disable the record start/stop beeps with `voice.beep_enabled: false`.
 
 ### Ending a voice chat by voice
 

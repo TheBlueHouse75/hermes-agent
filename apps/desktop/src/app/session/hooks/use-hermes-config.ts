@@ -19,6 +19,7 @@ import {
 import {
   applyAutoSpeakFromConfig,
   applyThinkingSoundFromConfig,
+  applyVoiceSilenceFromConfig,
   applyVoiceStopPhraseFromConfig
 } from '@/store/voice-prefs'
 
@@ -145,6 +146,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         }
 
         applyAutoSpeakFromConfig(config)
+        applyVoiceSilenceFromConfig(config)
         applyVoiceStopPhraseFromConfig(config)
         applyThinkingSoundFromConfig(config)
       } catch {

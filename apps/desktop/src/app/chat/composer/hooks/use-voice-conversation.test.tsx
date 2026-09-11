@@ -75,7 +75,7 @@ interface HookProps {
   busy: boolean
 }
 
-function renderConversation(overrides: { onInterrupt?: () => void; transcript?: string } = {}) {
+function renderConversation(overrides: { onInterrupt?: () => void; silenceMs?: number; transcript?: string } = {}) {
   const onInterrupt = overrides.onInterrupt ?? vi.fn()
 
   // Mirrors the real app: submitting a turn makes the agent busy.
@@ -105,7 +105,8 @@ function renderConversation(overrides: { onInterrupt?: () => void; transcript?: 
         onStopWord,
         onSubmit,
         onTranscribeAudio,
-        pendingResponse: () => null
+        pendingResponse: () => null,
+        silenceMs: overrides.silenceMs
       }),
     { initialProps: { busy: false } }
   )
@@ -143,6 +144,15 @@ describe('useVoiceConversation full-duplex barge-in', () => {
   })
 
   afterEach(cleanup)
+
+  it('uses the configured endpoint delay for normal turns and captured interruptions', async () => {
+    const { hook } = renderConversation({ silenceMs: 850 })
+
+    await enterThinking(hook)
+
+    expect(micHandle.start).toHaveBeenCalledWith(expect.objectContaining({ silenceMs: 850 }))
+    await waitFor(() => expect(monitorCalls.at(-1)?.utteranceSilenceMs).toBe(850))
+  })
 
   it('arms the barge monitor during generation (before any reply audio exists)', async () => {
     const { hook } = renderConversation()

@@ -36,6 +36,8 @@ interface VoiceConversationOptions {
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
+  /** End the utterance after this many milliseconds of confirmed silence. */
+  silenceMs?: number
   /** Awaited right before the mic is opened. Used to let the wake-word listener
    *  fully release the capture device first, so the two never contend. */
   beforeMicOpen?: () => Promise<void> | void
@@ -55,6 +57,7 @@ export function useVoiceConversation({
   onTranscribeAudio,
   pendingResponse,
   consumePendingResponse,
+  silenceMs = 1_250,
   beforeMicOpen
 }: VoiceConversationOptions) {
   const { t } = useI18n()
@@ -236,7 +239,7 @@ export function useVoiceConversation({
       // VAD tuning mirrors `tools.voice_mode` defaults so the browser loop matches the CLI.
       await handle.start({
         silenceLevel: 0.075,
-        silenceMs: 1_250,
+        silenceMs,
         idleSilenceMs: 12_000,
         onError: error => {
           notifyError(error, voiceCopy.microphoneFailed)
@@ -259,7 +262,7 @@ export function useVoiceConversation({
       setStatus('idle')
       onFatalError?.()
     }
-  }, [handle, handleTurn, onFatalError, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
+  }, [handle, handleTurn, onFatalError, silenceMs, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
 
   const settleAfterSpeech = useCallback(
     (barged: boolean, stoppedDuringSetup = false) => {
@@ -401,9 +404,10 @@ export function useVoiceConversation({
         bargeCapturePendingRef.current = false
         stopBargeMonitorRef.current = null
         void submitCapturedUtterance(audio)
-      }
+      },
+      utteranceSilenceMs: silenceMs
     })
-  }, [submitCapturedUtterance])
+  }, [silenceMs, submitCapturedUtterance])
 
   /** Push any new reply text into the live session; finish when complete. */
   const feedSpeechSession = useCallback(

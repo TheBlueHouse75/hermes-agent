@@ -7,9 +7,29 @@ import { getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 // and the Settings switch are one source of truth, not two that can disagree.
 export const $autoSpeakReplies = atom<boolean>(false)
 
+// Browser VAD currently needs at least a few animation frames of confirmed
+// quiet. Keep the existing 1.25s behavior when the setting is absent, while
+// allowing voice.silence_duration to lower the end-of-turn latency safely.
+const DEFAULT_VOICE_SILENCE_MS = 1_250
+const MIN_VOICE_SILENCE_MS = 300
+export const $voiceSilenceMs = atom<number>(DEFAULT_VOICE_SILENCE_MS)
+
 /** Seed the atom from a loaded config payload (mount / refresh). */
 export function applyAutoSpeakFromConfig(config: { voice?: { auto_tts?: unknown } | null } | null | undefined) {
   $autoSpeakReplies.set(Boolean(config?.voice?.auto_tts))
+}
+
+/** Seed the desktop endpoint delay from the canonical voice config. */
+export function applyVoiceSilenceFromConfig(
+  config: { voice?: { silence_duration?: unknown } | null } | null | undefined
+) {
+  const seconds = config?.voice?.silence_duration
+  const configuredMilliseconds = typeof seconds === 'number' && seconds > 0 ? seconds * 1_000 : Number.NaN
+  const milliseconds = Number.isFinite(configuredMilliseconds)
+    ? Math.round(configuredMilliseconds)
+    : DEFAULT_VOICE_SILENCE_MS
+
+  $voiceSilenceMs.set(Math.max(MIN_VOICE_SILENCE_MS, milliseconds))
 }
 
 // First configured `voice.stop_phrases` entry — drives the "Say "stop" to end

@@ -5,7 +5,30 @@ vi.mock('@/hermes', () => ({
   saveHermesConfig: vi.fn(async () => undefined)
 }))
 
-import { $voiceStopPhrase, applyVoiceStopPhraseFromConfig } from './voice-prefs'
+import {
+  $voiceSilenceMs,
+  $voiceStopPhrase,
+  applyVoiceSilenceFromConfig,
+  applyVoiceStopPhraseFromConfig
+} from './voice-prefs'
+
+describe('applyVoiceSilenceFromConfig', () => {
+  it('converts the configured seconds to milliseconds', () => {
+    applyVoiceSilenceFromConfig({ voice: { silence_duration: 0.85 } })
+    expect($voiceSilenceMs.get()).toBe(850)
+  })
+
+  it('keeps a safe floor and preserves the desktop default for invalid values', () => {
+    applyVoiceSilenceFromConfig({ voice: { silence_duration: 0.1 } })
+    expect($voiceSilenceMs.get()).toBe(300)
+
+    applyVoiceSilenceFromConfig({ voice: { silence_duration: 'fast' } })
+    expect($voiceSilenceMs.get()).toBe(1_250)
+
+    applyVoiceSilenceFromConfig({ voice: { silence_duration: Number.MAX_VALUE } })
+    expect($voiceSilenceMs.get()).toBe(1_250)
+  })
+})
 
 describe('applyVoiceStopPhraseFromConfig', () => {
   it('defaults to "stop" when the key is absent (backend default applies)', () => {
