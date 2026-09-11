@@ -13,6 +13,7 @@ import json
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 from agent.reasoning_effort import (
     KIMI_K3_EFFORTS,
     KIMI_K3_OVERRIDES,
@@ -326,6 +327,25 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
+# Hermes bookkeeping that rides on stored message dicts but has no place in the
+# Chat Completions schema (strict providers reject unknown keys, #47868). The
+# persistence-only fields come from their single source of truth; the rest is
+# transport-side scaffolding.
+_WIRE_FOREIGN_KEYS = PERSISTENCE_ONLY_MESSAGE_FIELDS | {
+    "codex_reasoning_items",
+    "codex_message_items",
+    "tool_name",
+    "effect_disposition",
+    "api_content",  # persist-what-you-send sidecar
+    "anthropic_content_blocks",
+    "bedrock_content_blocks",
+}
+
+
+def _carries_wire_foreign_keys(msg: dict) -> bool:
+    return not _WIRE_FOREIGN_KEYS.isdisjoint(msg)
+
+
 class ChatCompletionsTransport(ProviderTransport):
     """Transport for api_mode='chat_completions'.
 
@@ -390,17 +410,7 @@ class ChatCompletionsTransport(ProviderTransport):
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            if (
-                "codex_reasoning_items" in msg
-                or "codex_message_items" in msg
-                or "tool_name" in msg
-                or "effect_disposition" in msg
-                or "timestamp" in msg  # #47868 — strict providers reject this
-                or "platform_message_id" in msg  # gateway dedup id (persistence-only)
-                or "api_content" in msg  # persist-what-you-send sidecar
-                or "anthropic_content_blocks" in msg
-                or "bedrock_content_blocks" in msg
-            ):
+            if _carries_wire_foreign_keys(msg):
                 needs_sanitize = True
                 break
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
@@ -464,28 +474,10 @@ class ChatCompletionsTransport(ProviderTransport):
                     sanitized[msg_idx] = copied_msg
                 return copied_msg
 
-            if (
-                "codex_reasoning_items" in msg
-                or "codex_message_items" in msg
-                or "tool_name" in msg
-                or "effect_disposition" in msg
-                or "timestamp" in msg  # #47868 — leak into strict providers
-                or "platform_message_id" in msg  # gateway dedup id (persistence-only)
-                or "api_content" in msg  # persist-what-you-send sidecar
-                or "anthropic_content_blocks" in msg
-                or "bedrock_content_blocks" in msg
-            ):
+            if _carries_wire_foreign_keys(msg):
                 out_msg = mutable_msg()
-                out_msg.pop("codex_reasoning_items", None)
-                out_msg.pop("codex_message_items", None)
-                out_msg.pop("tool_name", None)
-                out_msg.pop("effect_disposition", None)
-                out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
-                out_msg.pop("platform_message_id", None)  # gateway dedup id
-                out_msg.pop("api_content", None)  # persist-what-you-send sidecar
-                out_msg.pop("anthropic_content_blocks", None)
-                out_msg.pop("bedrock_content_blocks", None)
-
+                for key in _WIRE_FOREIGN_KEYS:
+                    out_msg.pop(key, None)
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
             # OpenAI's message schema has no ``_``-prefixed fields, so this

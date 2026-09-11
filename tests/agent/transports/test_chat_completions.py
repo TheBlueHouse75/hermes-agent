@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+
+from agent.transports.chat_completions import _WIRE_FOREIGN_KEYS
 from openai import OpenAI
 
 from agent.transports import get_transport
@@ -139,6 +141,43 @@ class TestChatCompletionsBasic:
         assert result[0]["role"] == "user"
         # Original list untouched (deepcopy-on-demand)
         assert msgs[0]["timestamp"] == 1781976577.0
+
+    @pytest.mark.parametrize("key", sorted(_WIRE_FOREIGN_KEYS))
+    def test_convert_messages_strips_every_wire_foreign_key(self, transport, key):
+        """The strip list is now one shared set; dropping a key from it must
+        fail here rather than as a production 4xx from a strict gateway."""
+        msgs = [{"role": "user", "content": "hi", key: {"any": "value"}}]
+        result = transport.convert_messages(msgs)
+        assert key not in result[0]
+        assert result[0]["content"] == "hi"
+        assert key in msgs[0]  # the persisted original is never mutated
+
+    def test_convert_messages_strips_message_id_and_display_kind(self, transport):
+        """``message_id`` (gateway dedup id, see gateway/run.py) and
+        ``display_kind`` (timeline display metadata, see conversation_loop's
+        interrupt placeholder) are persistence-only bookkeeping, not part of
+        the OpenAI Chat Completions schema. Strict providers reject them:
+        Mistral responds HTTP 422 'extra_forbidden' on
+        ``messages[N].user.message_id``, Groq rejects
+        "property 'message_id' is unsupported". Regression test for the
+        2026-09-11 Ficelle router fallback breakage.
+        """
+        msgs = [
+            {
+                "role": "user",
+                "content": "hi",
+                "message_id": "msg_abc123",
+                "display_kind": "hidden",
+            },
+        ]
+        result = transport.convert_messages(msgs)
+        assert "message_id" not in result[0]
+        assert "display_kind" not in result[0]
+        assert result[0]["content"] == "hi"
+        assert result[0]["role"] == "user"
+        # Original list untouched (deepcopy-on-demand)
+        assert msgs[0]["message_id"] == "msg_abc123"
+        assert msgs[0]["display_kind"] == "hidden"
 
     def test_convert_messages_strips_provider_replay_sidecars(self, transport):
         """Native-provider replay channels must not cross a provider boundary.

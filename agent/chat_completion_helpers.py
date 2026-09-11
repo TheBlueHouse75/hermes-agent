@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import inspect
 import json
 import logging
 import math
@@ -39,7 +40,11 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
-from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.message_metadata import (
+    append_message,
+    stamp_message_timestamp,
+    strip_persistence_only_fields,
+)
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -2668,6 +2673,33 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
+def _fallback_call_site() -> str:
+    """Best-effort "module:line" of the external caller that triggered the
+    current fallback activation.
+
+    Walks past frames belonging to ``try_activate_fallback`` itself (the
+    chain-skip recursion re-enters via ``agent._try_activate_fallback``) and
+    its ``run_agent.py`` forwarder, so a recursive skip reports the site that
+    originally invoked the chain rather than itself.
+    """
+    # Diagnostics only: this runs inside the activation ``try`` whose except
+    # branch would misread any exception here as a failed swap, so never raise.
+    frame = inspect.currentframe()
+    try:
+        frame = frame.f_back if frame else None  # caller of this function
+        while frame is not None:
+            co = frame.f_code
+            if co.co_name in ("try_activate_fallback", "_try_activate_fallback"):
+                frame = frame.f_back
+                continue
+            return f"{os.path.basename(co.co_filename)}:{frame.f_lineno}"
+        return "unknown"
+    except Exception:
+        return "unknown"
+    finally:
+        del frame
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -3115,6 +3147,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
+        if reason is None:
+            # A reasoned failure already left an "API call failed" WARNING at
+            # its call site; a reason-less one leaves no other trail (2026-09-11:
+            # a healthy fallback was skipped with nothing logged in between).
+            logger.warning(
+                "Fallback activated with no failure reason: abandoning "
+                "%s/%s for %s/%s (called from %s)",
+                old_provider, old_model, fb_provider, fb_model,
+                _fallback_call_site(),
+            )
+
         notice = (
             f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
             f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
@@ -3225,12 +3268,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # ChatCompletionsTransport.convert_messages(), but the summary path
             # hand-builds messages and calls chat.completions.create() directly,
             # bypassing the transport — so mirror that sanitization here:
-            # tool_name (SQLite FTS bookkeeping), the codex_* reasoning carriers,
-            # timestamp (preserved on gateway user replay entries for the
-            # stale-confirmation expiry check — #47868 rejection class),
-            # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp", "platform_message_id"):
+            # tool_name (SQLite FTS bookkeeping), the codex_* reasoning
+            # carriers, the persistence-only fields (timestamp is kept on
+            # gateway user replay entries for the stale-confirmation expiry
+            # check yet must never reach the wire — the #47868 rejection
+            # class), and every Hermes-internal underscore-prefixed key.
+            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items"):
                 api_msg.pop(schema_foreign, None)
+            strip_persistence_only_fields(api_msg)
             # api_content (the persist-what-you-send sidecar) carries the
             # exact bytes every main-loop call sent for this message —
             # substitute it before dropping the key (Hermes bookkeeping,

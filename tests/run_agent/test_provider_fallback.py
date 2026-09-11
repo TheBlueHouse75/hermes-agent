@@ -112,15 +112,45 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
-    def test_records_user_visible_switch_with_reason(self):
+    def test_missing_reason_logs_diagnostic_warning(self, caplog):
+        """A reason-less activation has no other trail: it must log which
+        backend was abandoned, which one was activated, and who called it —
+        see the 2026-09-11 incident where a healthy fallback was skipped with
+        nothing logged in between the two "Model fallback" notices."""
+        agent = _make_agent(
+            fallback_model={"provider": "ficelle", "model": "auto-orchestrator"},
+        )
+        agent.model = "grok-4.6"
+        agent.provider = "xai-oauth"
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "auto-orchestrator"),
+            ),
+            caplog.at_level("WARNING", logger="agent.chat_completion_helpers"),
+        ):
+            assert agent._try_activate_fallback(None) is True
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "grok-4.6" in r.message and "xai-oauth" in r.message
+            and "auto-orchestrator" in r.message and "ficelle" in r.message
+            and "test_provider_fallback.py" in r.message
+            for r in warnings
+        )
+
+    def test_records_user_visible_switch_with_reason(self, caplog):
         agent = _make_agent(
             fallback_model={"provider": "zai", "model": "glm-5.2"},
         )
         agent.model = "gpt-5.6-sol"
         agent.provider = "openai-codex"
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2"),
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2"),
+            ),
+            caplog.at_level("WARNING", logger="agent.chat_completion_helpers"),
         ):
             assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
 
@@ -130,6 +160,9 @@ class TestFallbackChainAdvancement:
         )
         assert agent._pending_fallback_notice == [expected]
         assert agent._retry_status_buffer[-1] == ("status", expected)
+        # A reasoned failure already logs "API call failed" at its call site;
+        # the reason-less diagnostic must stay silent here.
+        assert not any("no failure reason" in r.message for r in caplog.records)
 
     def test_records_sequential_switches_in_order(self):
         agent = _make_agent(

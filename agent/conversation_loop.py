@@ -42,7 +42,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
-from agent.message_metadata import append_message
+from agent.message_metadata import append_message, strip_persistence_only_fields
 from agent.turn_context import (
     PreflightCompressionTimedOut,
     _compression_warrants_another_preflight_pass,
@@ -2496,12 +2496,12 @@ def run_conversation(
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)
 
-            # Display-only timeline metadata. Never a provider field — strip
-            # from every outgoing copy so strict OpenAI-compatible backends
-            # don't reject the request after a model switch or resumed typed
-            # event row enters the live history.
-            api_msg.pop("display_kind", None)
-            api_msg.pop("display_metadata", None)
+            # Persistence-only metadata (display_kind/display_metadata, ids,
+            # timestamp). Never provider fields — strip from every outgoing
+            # copy so strict OpenAI-compatible backends don't reject the
+            # request after a model switch or resumed typed event row enters
+            # the live history.
+            strip_persistence_only_fields(api_msg)
 
             # Durable row identity stamped by _rows_to_conversation so the
             # desktop can address a specific persisted message (reactions).
