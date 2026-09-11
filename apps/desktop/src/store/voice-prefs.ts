@@ -25,6 +25,7 @@ export function applyVoiceSilenceFromConfig(
 ) {
   const seconds = config?.voice?.silence_duration
   const configuredMilliseconds = typeof seconds === 'number' && seconds > 0 ? seconds * 1_000 : Number.NaN
+
   const milliseconds = Number.isFinite(configuredMilliseconds)
     ? Math.round(configuredMilliseconds)
     : DEFAULT_VOICE_SILENCE_MS
