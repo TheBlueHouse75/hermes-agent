@@ -106,7 +106,7 @@ def _xai_credentials_present() -> bool:
     schema registration if creds expire. Also used by ``provider_readiness_status`` for ``xai_grok`` rows."""
     try:
         from hermes_cli.auth import _read_xai_oauth_tokens
-        _read_xai_oauth_tokens()
+        _read_xai_oauth_tokens(_lock=False, preserve_corrupt_store=False)
         return True
     except Exception:
         pass

@@ -596,6 +596,7 @@ def _empty_auth_store() -> Dict[str, Any]:
 
 def _load_auth_store(
     auth_file: Optional[Path] = None, *, fail_closed: bool = False,
+    preserve_corrupt_store: bool = True,
 ) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
@@ -615,18 +616,24 @@ def _load_auth_store(
         # Genuine corruption: unparseable JSON or non-UTF-8 bytes. Preserve a copy, but never
         # advertise a backup that was not written.
         corrupt_path = auth_file.with_suffix(".json.corrupt")
-        try:
-            shutil.copy2(auth_file, corrupt_path)
-            preserved = True
-        except Exception:
-            preserved = False
-            logger.debug("auth: could not preserve a copy of the corrupt store at %s", corrupt_path,
-                         exc_info=True)
+        preserved = False
+        if preserve_corrupt_store:
+            try:
+                shutil.copy2(auth_file, corrupt_path)
+                preserved = True
+            except Exception:
+                logger.debug("auth: could not preserve a copy of the corrupt store at %s", corrupt_path,
+                             exc_info=True)
+        preservation_message = (
+            "Corrupt file preserved at" if preserved
+            else "A copy could NOT be preserved at" if preserve_corrupt_store
+            else "Corrupt-file preservation was suppressed for this read at"
+        )
         logger.warning(
             "auth: failed to parse %s (%s), %s. %s %s",
             auth_file, exc,
             "refusing the shared store" if fail_closed else "starting with empty store",
-            "Corrupt file preserved at" if preserved else "A copy could NOT be preserved at",
+            preservation_message,
             corrupt_path)
         if fail_closed:
             raise AuthError(
@@ -804,7 +811,9 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(
+    provider_id: Optional[str] = None, *, preserve_corrupt_store: bool = True,
+) -> Dict[str, Any]:
     """Return one resolved provider slice, or a read-only merged whole-pool view."""
     from hermes_cli.auth_shared_authority import (
         _SHAREABLE_PROVIDER_IDS, resolve_auth_store_authority,
@@ -819,6 +828,7 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
                 continue
             shared_pool = _load_auth_store(
                 authority.store_path, fail_closed=True,
+                preserve_corrupt_store=preserve_corrupt_store,
             ).get("credential_pool")
             entries = shared_pool.get(candidate) if isinstance(shared_pool, dict) else None
             if isinstance(entries, list):
@@ -830,6 +840,7 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     authority = resolve_auth_store_authority(provider_id)
     pool = _load_auth_store(
         authority.store_path, fail_closed=authority.shared,
+        preserve_corrupt_store=preserve_corrupt_store,
     ).get("credential_pool")
     entries = pool.get(provider_id) if isinstance(pool, dict) else None
     return list(entries) if isinstance(entries, list) else []
@@ -1845,7 +1856,7 @@ _is_terminal_codex_oauth_refresh_error = partial(
 
 
 def _codex_pool_rate_limited_status() -> Optional[Dict[str, Any]]:
-    rate_limit = _codex_pool_rate_limit_status()
+    rate_limit = _codex_pool_rate_limit_status(preserve_corrupt_store=False)
     if not rate_limit:
         return None
     from hermes_cli.auth_shared_authority import resolve_auth_store_authority

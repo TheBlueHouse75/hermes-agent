@@ -124,15 +124,24 @@ def resolved_auth_store_transaction(
         )
 
 
-def _load_auth_store_maybe_locked(lock: bool, *, provider_id: str = "openai-codex") -> Dict[str, Any]:
+def _load_auth_store_maybe_locked(
+    lock: bool, *, provider_id: str = "openai-codex",
+    preserve_corrupt_store: bool = True,
+) -> Dict[str, Any]:
     """Load one provider's resolved store, locking it unless the caller already holds it."""
     from hermes_cli.auth import _auth_store_lock, _load_auth_store
 
     authority = resolve_auth_store_authority(provider_id)
     if lock:
         with _auth_store_lock(target_path=authority.store_path):
-            return _load_auth_store(authority.store_path, fail_closed=authority.shared)
-    return _load_auth_store(authority.store_path, fail_closed=authority.shared)
+            return _load_auth_store(
+                authority.store_path, fail_closed=authority.shared,
+                preserve_corrupt_store=preserve_corrupt_store,
+            )
+    return _load_auth_store(
+        authority.store_path, fail_closed=authority.shared,
+        preserve_corrupt_store=preserve_corrupt_store,
+    )
 
 
 def _refresh_payload_access_token(

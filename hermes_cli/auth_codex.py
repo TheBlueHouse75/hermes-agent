@@ -79,10 +79,14 @@ def _codex_runtime_result(
         "source": source, "last_refresh": last_refresh, "auth_mode": "chatgpt"}
 
 
-def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+def _read_codex_tokens(
+    *, _lock: bool = True, preserve_corrupt_store: bool = True,
+) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json)."""
     from hermes_cli.auth import _load_provider_state, _nonempty_str
-    auth_store = _load_auth_store_maybe_locked(_lock)
+    auth_store = _load_auth_store_maybe_locked(
+        _lock, preserve_corrupt_store=preserve_corrupt_store,
+    )
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise _codex_err(_NO_CREDENTIALS_MSG.format(relogin=_codex_relogin_command()),
@@ -532,7 +536,7 @@ def resolve_codex_runtime_credentials(
             # A read-only report takes no store lock: ``_save_auth_store`` replaces auth.json
             # atomically, and materialising ``auth.lock`` is itself a write a diagnostic must not
             # make. No recovery follows a read-only read, so no observed token is needed.
-            data = _read_codex_tokens(_lock=False)
+            data = _read_codex_tokens(_lock=False, preserve_corrupt_store=False)
         else:
             with _provider_state_transaction("openai-codex") as (_store, state, _source):
                 # Observe the singleton in the same locked snapshot the read validates, so recovery
@@ -550,7 +554,7 @@ def resolve_codex_runtime_credentials(
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
     if data is None:
-        pool_token = _pool_codex_access_token()
+        pool_token = _pool_codex_access_token(preserve_corrupt_store=not read_only)
         if pool_token and force_refresh and not read_only:
             # Pool-only setup: a forced refresh must rotate the pool entry, not resend its token.
             from agent.credential_pool import load_pool
@@ -558,7 +562,7 @@ def resolve_codex_runtime_credentials(
             pool_token = refreshed.runtime_api_key if refreshed is not None else ""
         if pool_token:
             return _codex_runtime_result(pool_token, source="credential_pool", last_refresh=None)
-        pool_rate_limit = _codex_pool_rate_limit_status()
+        pool_rate_limit = _codex_pool_rate_limit_status(preserve_corrupt_store=not read_only)
         if pool_rate_limit:
             # Before surfacing the persisted cooldown, ask the usage endpoint whether the quota
             # reset early (banked reset redeemed, plan upgraded): ``last_error_reset_at`` can be
@@ -566,7 +570,7 @@ def resolve_codex_runtime_credentials(
             if _probe_codex_pool_entry_quota_restored(pool_rate_limit):
                 logger.info("Codex quota restored upstream — clearing stale pool cooldown(s).")
                 clear_codex_pool_quota_cooldowns()
-                pool_token = _pool_codex_access_token()
+                pool_token = _pool_codex_access_token(preserve_corrupt_store=not read_only)
                 if pool_token:
                     return _codex_runtime_result(
                         pool_token, source="credential_pool", last_refresh=None)
@@ -833,13 +837,17 @@ def _codex_pool_dicts(entries: Optional[List[Any]]) -> Iterator[Dict[str, Any]]:
             yield entry
 
 
-def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
+def _codex_pool_rate_limit_status(
+    *, preserve_corrupt_store: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Return metadata for a pool-only Codex credential in quota cooldown."""
     from hermes_cli.auth import _nonempty_str, read_credential_pool
     from agent.credential_pool import _parse_absolute_timestamp
     try:
         now = time.time()
-        for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
+        for entry in _codex_pool_dicts(read_credential_pool(
+            "openai-codex", preserve_corrupt_store=preserve_corrupt_store,
+        )):
             token = entry.get("access_token")
             if not _nonempty_str(token) or not _entry_is_rate_limit_exhausted(entry):
                 continue
@@ -863,7 +871,7 @@ def _pool_entries(auth_store: Dict[str, Any], provider_id: str) -> Optional[List
     return entries if isinstance(entries, list) else None
 
 
-def _pool_codex_access_token() -> str:
+def _pool_codex_access_token(*, preserve_corrupt_store: bool = True) -> str:
     """First non-empty pool access_token not in an exhaustion cooldown window, else "".
 
     Fallback for ``resolve_codex_runtime_credentials`` when the singleton has no creds.
@@ -871,7 +879,9 @@ def _pool_codex_access_token() -> str:
     from agent.credential_pool import _parse_absolute_timestamp
     from hermes_cli.auth import _nonempty_str, read_credential_pool
     try:
-        for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
+        for entry in _codex_pool_dicts(read_credential_pool(
+            "openai-codex", preserve_corrupt_store=preserve_corrupt_store,
+        )):
             token = entry.get("access_token")
             # Same normaliser as ``_codex_pool_rate_limit_status``: a millisecond epoch compared
             # raw reads as far-future here and as elapsed there, hiding a usable entry (#103349).

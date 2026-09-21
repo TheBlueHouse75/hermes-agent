@@ -2915,7 +2915,7 @@ def load_pool_snapshot(provider: str) -> CredentialPool:
     memory so a diagnostic still reports the same credentials as runtime.
     """
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    raw_entries = read_credential_pool(provider, preserve_corrupt_store=False)
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
     if provider in _TOKENS_SINGLETON_PROVIDERS:
         try:
@@ -2924,6 +2924,7 @@ def load_pool_snapshot(provider: str) -> CredentialPool:
             authority = resolve_auth_store_authority(provider)
             auth_store = _load_auth_store(
                 authority.store_path, fail_closed=authority.shared,
+                preserve_corrupt_store=False,
             )
             _seed_tokens_singleton(_Seeder(provider, entries), auth_store)
         except Exception:

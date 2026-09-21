@@ -558,6 +558,41 @@ def test_malformed_or_missing_root_store_never_breaks_a_profile_read(profile_env
     assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
 
 
+@pytest.mark.parametrize(
+    ("provider_id", "status_getter"),
+    [
+        ("openai-codex", "get_codex_auth_status"),
+        ("xai-oauth", "get_xai_oauth_auth_status"),
+    ],
+)
+def test_shared_corrupt_store_status_and_availability_are_non_mutating(
+    profile_env, provider_id, status_getter,
+):
+    """A malformed shared authority fails closed without a backup or lock sidecar."""
+    import hermes_cli.auth as auth
+    from hermes_cli.auth_shared_authority import has_provider_credentials
+
+    _grant_shared_providers(profile_env, provider_id)
+    root_file = profile_env["global"] / "auth.json"
+    root_file.write_text("{ malformed", encoding="utf-8")
+    before = root_file.read_bytes()
+    before_mtime = root_file.stat().st_mtime_ns
+
+    status = getattr(auth, status_getter)()
+    assert status["logged_in"] is False
+    assert has_provider_credentials(provider_id) is False
+    if provider_id == "xai-oauth":
+        from hermes_cli.tools_config import _xai_credentials_present
+
+        _xai_credentials_present()
+
+    assert root_file.read_bytes() == before
+    assert root_file.stat().st_mtime_ns == before_mtime
+    assert not root_file.with_suffix(".json.corrupt").exists()
+    assert not (profile_env["global"] / "auth.lock").exists()
+    assert not (profile_env["profile"] / "auth.lock").exists()
+
+
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
     """Changing profile context cannot inherit another store's lock depth."""
     import hermes_cli.auth as auth

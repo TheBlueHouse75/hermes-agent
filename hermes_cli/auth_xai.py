@@ -70,9 +70,14 @@ def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
     return isinstance(state, dict) and all(_token_pair(state.get("tokens")))
 
 
-def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+def _read_xai_oauth_tokens(
+    *, _lock: bool = True, preserve_corrupt_store: bool = True,
+) -> Dict[str, Any]:
     state = _xai_oauth_state_from_store(
-        _load_auth_store_maybe_locked(_lock, provider_id="xai-oauth")
+        _load_auth_store_maybe_locked(
+            _lock, provider_id="xai-oauth",
+            preserve_corrupt_store=preserve_corrupt_store,
+        )
     )
     if not state:
         raise _xai_err(
@@ -406,7 +411,9 @@ def resolve_xai_oauth_runtime_credentials(
     # Status/doctor must not materialize auth.lock: an atomic auth.json
     # replacement makes an unlocked snapshot sufficient when no recovery,
     # refresh, quarantine, adoption, or seed may follow.
-    data = _read_xai_oauth_tokens(_lock=not read_only)
+    data = _read_xai_oauth_tokens(
+        _lock=not read_only, preserve_corrupt_store=not read_only,
+    )
     tokens = dict(data["tokens"])
     refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
     if _should_refresh(data):
