@@ -16,7 +16,6 @@ clear "sign in" error from :meth:`search` rather than a silently different backe
 
 from __future__ import annotations
 
-import json
 from typing import Any, Dict
 
 from plugins.web._common import BaseWebSearchProvider, search_fail
@@ -26,10 +25,6 @@ _UNSUPPORTED_MSG = (
     "client-side search and requires the Codex Responses transport (provider "
     "openai-codex). For client-side search use firecrawl (default) or another backend."
 )
-
-
-def _dget(obj: Any, key: str) -> Any:
-    return obj.get(key) if isinstance(obj, dict) else None
 
 
 def has_codex_credentials() -> bool:
@@ -43,22 +38,9 @@ def has_codex_credentials() -> bool:
     multi-account grants never write the providers singleton). Returns False on any
     exception so a corrupted auth store cannot block other availability scans.
     """
-    try:
-        from hermes_constants import get_hermes_home
+    from hermes_cli.auth_shared_authority import has_provider_credentials
 
-        auth_path = get_hermes_home() / "auth.json"
-        if not auth_path.exists():
-            return False
-        store = json.loads(auth_path.read_text(encoding="utf-8-sig"))
-        tokens = _dget(_dget(_dget(store, "providers"), "openai-codex"), "tokens")
-        if str(_dget(tokens, "access_token") or "").strip():
-            return True
-        entries = _dget(_dget(store, "credential_pool"), "openai-codex")
-        return isinstance(entries, list) and any(
-            isinstance(e, dict) and str(e.get("access_token", "") or "").strip() for e in entries
-        )
-    except Exception:  # noqa: BLE001 — availability must never raise
-        return False
+    return has_provider_credentials("openai-codex")
 
 
 class OpenAINativeWebSearchProvider(BaseWebSearchProvider):

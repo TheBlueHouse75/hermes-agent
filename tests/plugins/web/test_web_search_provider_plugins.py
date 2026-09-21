@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -265,6 +267,25 @@ class TestIsAvailable:
         assert p.is_available() is False  # no XAI_API_KEY, no auth.json
         monkeypatch.setenv("XAI_API_KEY", "real")
         assert p.is_available() is True
+
+    def test_openai_native_reads_resolved_authority_store(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        authority_store = tmp_path / "authority" / "auth.json"
+        authority_store.parent.mkdir()
+        authority_store.write_text(json.dumps({
+            "providers": {
+                "openai-codex": {"tokens": {"access_token": "authority-token"}},
+            },
+        }), encoding="utf-8")
+        monkeypatch.setattr(
+            "hermes_cli.auth_shared_authority.resolve_auth_store_authority",
+            lambda _provider: SimpleNamespace(store_path=authority_store),
+        )
+
+        from plugins.web.openai_native.provider import has_codex_credentials
+
+        assert has_codex_credentials() is True
 
 
 # ---------------------------------------------------------------------------

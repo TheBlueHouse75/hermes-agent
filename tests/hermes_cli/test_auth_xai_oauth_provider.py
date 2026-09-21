@@ -372,6 +372,32 @@ def test_get_xai_oauth_auth_status_logged_out(tmp_path, monkeypatch):
     assert "error" in status
 
 
+@pytest.mark.parametrize("expired", [False, True])
+def test_xai_status_read_is_lock_free_and_preserves_auth_store(tmp_path, monkeypatch, expired):
+    """Status/doctor neither refreshes nor materialises auth.lock for xAI OAuth."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if expired:
+        auth_file = _setup_hermes_auth(
+            hermes_home,
+            access_token=_jwt_with_exp(int(time.time()) - 60),
+            refresh_token="expired-refresh",
+        )
+    else:
+        auth_file = hermes_home / "auth.json"
+        auth_file.write_text(json.dumps({"version": 1, "providers": {}}), encoding="utf-8")
+    before = auth_file.read_bytes()
+    before_mtime = auth_file.stat().st_mtime_ns
+
+    status = get_xai_oauth_auth_status()
+
+    assert status["logged_in"] is expired
+    assert not (hermes_home / "auth.lock").exists()
+    assert auth_file.read_bytes() == before
+    assert auth_file.stat().st_mtime_ns == before_mtime
+
+
 # ---------------------------------------------------------------------------
 # refresh_xai_oauth_pure error handling
 # ---------------------------------------------------------------------------

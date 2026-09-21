@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import uuid
 from typing import Any, Dict, Optional
@@ -28,25 +27,16 @@ def has_xai_credentials() -> bool:
     multi-account grants never write the providers singleton). Returns False on any exception
     so a corrupted auth store can't block other availability scans.
     """
-    from agent.secret_scope import get_secret
-
-    if (get_secret("XAI_API_KEY", "") or "").strip():
-        return True
     try:
-        from hermes_constants import get_hermes_home
-        auth_path = get_hermes_home() / "auth.json"
-        if not auth_path.exists():
-            return False
-        store = json.loads(auth_path.read_text(encoding="utf-8-sig"))
-        tokens = _dict_get(_dict_get(_dict_get(store, "providers"), "xai-oauth"), "tokens")
-        if str(_dict_get(tokens, "access_token") or "").strip():
+        from agent.secret_scope import get_secret
+
+        if (get_secret("XAI_API_KEY", "") or "").strip():
             return True
-        entries = _dict_get(_dict_get(store, "credential_pool"), "xai-oauth")
-        return isinstance(entries, list) and any(
-            isinstance(e, dict) and str(e.get("access_token", "") or "").strip() for e in entries
-        )
     except Exception:
         return False
+    from hermes_cli.auth_shared_authority import has_provider_credentials
+
+    return has_provider_credentials("xai-oauth")
 
 
 def hermes_xai_user_agent() -> str:

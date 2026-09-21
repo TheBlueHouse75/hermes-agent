@@ -1786,12 +1786,26 @@ def _credential_fingerprint(provider: str) -> str:
         except Exception:
             pass
 
+    local_auth_path = None
     try:
         from hermes_constants import get_hermes_home
-        for rel in ("auth.json", "credentials.json"):
-            _mtime_part(rel, get_hermes_home() / rel)
+
+        local_home = get_hermes_home()
+        local_auth_path = local_home / "auth.json"
+        _mtime_part("auth.json", local_auth_path)
+        _mtime_part("credentials.json", local_home / "credentials.json")
     except Exception:
         pass
+    if provider in {"openai-codex", "xai-oauth"}:
+        try:
+            from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+            authority_path = resolve_auth_store_authority(provider).store_path
+            if authority_path != local_auth_path:
+                _mtime_part(f"{provider}:authority-auth.json", authority_path)
+        except Exception:
+            # A failed authority lookup must not share a cache entry with local-only auth.
+            parts.append(f"{provider}:authority-resolution-failed")
     for rel in ("~/.codex/auth.json", "~/.claude/.credentials.json",
                 "~/.config/github-copilot/hosts.json", "~/.minimax/credentials.json"):
         path = os.path.expanduser(rel)

@@ -192,6 +192,34 @@ class TestExplicitEncodingPassed:
 # asymmetry on Windows — these tests pin the sibling reads too.
 
 class TestAuthJsonSiblingReaders:
+    def test_has_xai_credentials_fails_closed_when_secret_lookup_raises(self):
+        from tools.xai_http import has_xai_credentials
+
+        with mock.patch(
+            "agent.secret_scope.get_secret", side_effect=RuntimeError("scope unavailable")
+        ):
+            assert has_xai_credentials() is False
+
+    def test_has_xai_credentials_reads_resolved_authority_store(
+        self, hermes_home, monkeypatch
+    ):
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        authority_store = hermes_home.parent / "authority" / "auth.json"
+        _write_utf8(authority_store, {
+            "providers": {
+                "xai-oauth": {"tokens": {"access_token": "authority-token"}},
+            },
+        })
+
+        from tools.xai_http import has_xai_credentials
+
+        authority = mock.Mock(store_path=authority_store)
+        with mock.patch(
+            "hermes_cli.auth_shared_authority.resolve_auth_store_authority",
+            return_value=authority,
+        ):
+            assert has_xai_credentials() is True
+
     def test_has_xai_credentials_reads_non_ascii_store(self, hermes_home, windows_default_encoding, monkeypatch):
         """tools/xai_http.has_xai_credentials must read a non-ASCII auth.json.
 

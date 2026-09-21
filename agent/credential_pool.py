@@ -1104,7 +1104,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
     _sync_anthropic_entry_from_pool_store = _sync_entry_from_pool_store
 
-    def _sync_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
+    def _sync_entry_from_auth_store(
+        self, entry: PooledCredential, *, persist: bool = True,
+    ) -> PooledCredential:
         """Sync a Codex / xAI device_code entry from auth.json ``providers.<id>.tokens``.
 
         A fresh ``hermes model`` / ``hermes auth`` login writes new tokens
@@ -1123,8 +1125,12 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         if entry.source not in sources:
             return entry
         try:
-            with _auth_store_lock():
-                state = _load_provider_state(_load_auth_store(), self.provider)
+            from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+            with resolved_auth_store_transaction(self.provider) as (auth_store, _source_path):
+                state = _load_provider_state(
+                    auth_store, self.provider,
+                )
             tokens = state.get("tokens") if isinstance(state, dict) else None
             if not isinstance(tokens, dict):
                 return entry
@@ -1179,7 +1185,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 }
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
-                return self._adopt(entry, **field_updates)
+                return self._adopt(entry, persist=persist, **field_updates)
         except Exception as exc:
             logger.debug("Failed to sync %s entry from auth.json: %s", display, exc)
         return entry
@@ -1235,15 +1241,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         if entry.source != "device_code" or self.provider not in ("nous", *_TOKENS_SINGLETON_PROVIDERS):
             return
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+            with resolved_auth_store_transaction(self.provider) as (auth_store, source_path):
                 state = _load_provider_state(auth_store, self.provider)
                 if not isinstance(state, dict):
                     return
                 if not self._apply_entry_to_singleton_state(entry, state):
                     return
                 _store_provider_state(auth_store, self.provider, state, set_active=False)
-                _save_auth_store(auth_store)
+                _save_auth_store(auth_store, target_path=source_path)
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
@@ -1284,6 +1291,31 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         if self.provider not in _SINGLE_USE_REFRESH_PROVIDERS and plugin_refresh_hook(self.provider) is None:
             return self._refresh_entry_impl(entry, force=force)
 
+        # Codex and xAI rotate a pool row and its provider singleton together.
+        # Every mutation of that pair takes the in-process pool RLock before
+        # the resolved authority lock: ordinary persistence follows the same
+        # order, so a deferred refresh cannot deadlock against a pool flush.
+        # Keep both locks through sync -> POST -> one atomic save; the RLock
+        # makes the helper's entries()/sync calls safe without weakening the
+        # single-use refresh-token serialization.
+        if self.provider in _TOKENS_SINGLETON_PROVIDERS:
+            from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+            target_path = resolve_auth_store_authority(self.provider).store_path
+            with self._lock:
+                with _auth_store_lock(
+                    timeout_seconds=self._single_use_refresh_lock_timeout(), target_path=target_path,
+                ):
+                    if self.provider == "openai-codex":
+                        synced = self._sync_entry_from_auth_store(entry)
+                        if synced is not entry and not force and not self._entry_needs_refresh(synced):
+                            return synced
+                        return self._refresh_entry_impl(synced, force=force)
+                    synced = self._sync_entry_from_pool_store(entry)
+                    if synced.access_token != entry.access_token or synced.refresh_token != entry.refresh_token:
+                        return synced
+                    return self._refresh_entry_impl(synced, force=force)
+
         # Single-use refresh tokens: sync -> POST -> write-back must be atomic
         # across Hermes processes, or two processes adopt the same on-disk
         # token, both POST it, and the loser gets ``refresh_token_reused`` /
@@ -1291,12 +1323,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # there was no recovery path at all). Serialize through the shared
         # cross-process auth-store flock; a waiter's in-lock re-sync picks up
         # the winner's rotated token and skips the POST.
-        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
-            if self.provider == "openai-codex":
-                synced = self._sync_entry_from_auth_store(entry)
-                if synced is not entry and not force and not self._entry_needs_refresh(synced):
-                    return synced
-                return self._refresh_entry_impl(synced, force=force)
+        with _auth_store_lock(
+            timeout_seconds=self._single_use_refresh_lock_timeout(),
+        ):
             synced = self._sync_entry_from_pool_store(entry)
             if self.provider == "anthropic" and synced.source == "claude_code":
                 # claude_code entries are NOT profile-owned: the refresh token
@@ -1336,6 +1365,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         exc: BaseException,
         *,
         store: str,
+        source_path: Optional[Path] = None,
     ) -> None:
         """Quarantine an entry whose rotated pair never reached its store.
 
@@ -1349,10 +1379,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         so it surfaces as an explicit re-auth requirement.
         """
         logger.error(
-            "Anthropic %s refresh rotated the single-use token but could not commit it "
+            "%s %s refresh rotated the single-use token but could not commit it "
             "to %s (%s) — failing closed and quarantining the credential; "
             "re-authenticate to recover",
-            entry.source, store, exc,
+            self.provider, entry.source, store, exc,
         )
         try:
             from agent.anthropic_credentials import (
@@ -1368,7 +1398,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             mark_rotation_consumed_uncommitted(
                 entry.access_token,
                 entry.refresh_token,
-                source_path=spent_rotation_source_path(entry.source),
+                source_path=source_path or spent_rotation_source_path(entry.source),
             )
         except Exception:  # pragma: no cover - never block the quarantine
             logger.debug("Failed to record consumed rotation fingerprints", exc_info=True)
@@ -1461,6 +1491,55 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             last_refresh=refreshed.get("last_refresh"),
         )
 
+    def _refresh_tokens_singleton_entry(self, entry: PooledCredential, *, force: bool) -> PooledCredential:
+        """Rotate a Codex/xAI singleton-backed row in one authority-store commit."""
+        from agent.anthropic_credentials import (
+            is_rotation_consumed_uncommitted, mark_rotation_consumed_uncommitted,
+        )
+        from hermes_cli.auth import _replace_credential_pool_entries
+        from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+        with resolved_auth_store_transaction(
+            self.provider, self._single_use_refresh_lock_timeout(),
+        ) as (auth_store, source_path):
+            if is_rotation_consumed_uncommitted(entry.refresh_token, source_path=source_path):
+                raise _RefreshDone(self._fail_closed_unpersisted_rotation(
+                    entry, RuntimeError("rotation never committed"), store=str(source_path),
+                    source_path=source_path,
+                ))
+            synced = self._sync_entry_from_auth_store(entry, persist=False)
+            if synced is not entry and not force and not self._entry_needs_refresh(synced):
+                return synced
+            entry = synced
+            updated = replace(self._post_tokens_refresh(entry), **_MARK_OK)
+            entries = [updated if current.id == entry.id else current for current in self.entries()]
+            state = _load_provider_state(auth_store, self.provider)
+            if entry.source == "device_code" and isinstance(state, dict):
+                if not self._apply_entry_to_singleton_state(updated, state):
+                    mark_rotation_consumed_uncommitted(
+                        entry.access_token, entry.refresh_token, source_path=source_path,
+                    )
+                    raise _RefreshDone(self._fail_closed_unpersisted_rotation(
+                        entry, RuntimeError("invalid provider singleton"), store=str(source_path),
+                        source_path=source_path,
+                    ))
+                _store_provider_state(auth_store, self.provider, state, set_active=False)
+            _replace_credential_pool_entries(
+                auth_store, self.provider, [current.to_dict() for current in entries],
+                status_cleared_ids=[updated.id],
+            )
+            try:
+                _save_auth_store(auth_store, target_path=source_path)
+            except Exception as exc:
+                mark_rotation_consumed_uncommitted(
+                    entry.access_token, entry.refresh_token, source_path=source_path,
+                )
+                raise _RefreshDone(self._fail_closed_unpersisted_rotation(
+                    entry, exc, store=str(source_path), source_path=source_path,
+                )) from exc
+        self._replace_entry(entry, updated)
+        return updated
+
     def _refresh_entry_impl(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         # Single-use-token providers adopt fresher tokens from their store
         # BEFORE spending the refresh_token; ``entry`` is rebound to the synced
@@ -1469,8 +1548,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if self.provider == "anthropic":
                 updated = self._refresh_anthropic(entry)
             elif self.provider in _TOKENS_SINGLETON_PROVIDERS:
-                entry = self._sync_entry_from_auth_store(entry)
-                updated = self._post_tokens_refresh(entry)
+                return self._refresh_tokens_singleton_entry(entry, force=force)
             elif (plugin_refresh := plugin_refresh_hook(self.provider)) is not None:
                 rotated = plugin_refresh(entry)
                 if not rotated:
@@ -1641,8 +1719,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """Drop the dead Codex/xAI token pair from auth.json unless a peer already rotated it."""
         display = _TOKENS_SINGLETON_PROVIDERS[self.provider][1]
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+            with resolved_auth_store_transaction(self.provider) as (auth_store, source_path):
                 state = _load_provider_state(auth_store, self.provider) or {}
                 tokens = (state.get("tokens") or {}) if isinstance(state, dict) else None
                 if isinstance(tokens, dict):
@@ -1659,8 +1738,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                             "relogin_required": True,
                             "at": datetime.now(timezone.utc).isoformat(),
                         }
-                        _save_provider_state(auth_store, self.provider, state)
-                        _save_auth_store(auth_store)
+                        _store_provider_state(auth_store, self.provider, state, set_active=False)
+                        _save_auth_store(auth_store, target_path=source_path)
         except Exception as clear_exc:
             logger.debug("Failed to clear terminal %s OAuth state: %s", display, clear_exc)
 
@@ -1700,25 +1779,23 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             entry.last_error_code, entry.last_error_reason, entry.last_error_message,
         ):
             return False
-        token = entry.access_token or ""
-        if not token:
+        if not entry.access_token:
             return False
         try:
-            # An exhausted entry is skipped by the refresh chain, so its stored token is usually
-            # expired by probe time (401 -> None -> cooldown kept, #89415): refresh it first.
-            fresh = auth_mod._refresh_expired_codex_probe_token(token, entry.refresh_token)
-            if fresh:
-                # Persist the rotated pair on both sides the way ``_refresh_entry`` does:
-                # ``last_refresh`` plus the singleton write-back, or the next selection's
-                # auth-store sync re-adopts the consumed pair from ``providers.openai-codex``
-                # and clears the cooldown with it.
-                entry = self._adopt(
-                    entry, access_token=fresh["access_token"], refresh_token=fresh["refresh_token"],
-                    last_refresh=fresh.get("last_refresh") or entry.last_refresh,
+            from hermes_cli.auth_codex import _probe_codex_pool_entry_quota_restored
+
+            payload = entry.to_dict()
+            restored = _probe_codex_pool_entry_quota_restored(payload)
+            if (payload.get("access_token"), payload.get("refresh_token")) != (
+                entry.access_token, entry.refresh_token,
+            ):
+                self._adopt(
+                    entry,
+                    access_token=str(payload.get("access_token") or entry.access_token),
+                    refresh_token=str(payload.get("refresh_token") or entry.refresh_token),
+                    last_refresh=payload.get("last_refresh") or entry.last_refresh,
                 )
-                self._sync_device_code_entry_to_auth_store(entry)
-                token = entry.access_token or token
-            return bool(auth_mod._probe_codex_quota_restored(token, base_url=entry.base_url))
+            return bool(restored)
         except Exception:
             logger.debug("Codex quota-restored probe failed", exc_info=True)
             return False
@@ -1758,11 +1835,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return self._select_unlocked(model=model)
 
     def _refresh_pending_entries(self, pending: List[PooledCredential]) -> None:
-        """Refresh deferred single-use-token entries OUTSIDE the pool lock.
+        """Start deferred single-use refreshes after selection releases the pool lock.
 
-        Each refresh takes the cross-process ``_auth_store_lock`` (20+ s
-        possible) and merges into the pool through the self-locking mutation
-        primitives; failures are silently skipped.
+        Codex/xAI reacquire the pool RLock before their authority lock so the
+        token-pair rotation follows the same lock order as persistence.
         """
         for entry in pending:
             self._refresh_entry(entry, force=False)
@@ -2550,6 +2626,14 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: Dict[str, Any]) -> None:
 
 def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     seed = _Seeder(provider, entries)
+    if provider in _TOKENS_SINGLETON_PROVIDERS:
+        from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+        with resolved_auth_store_transaction(provider) as (auth_store, _source_path):
+            if provider == "openai-codex" and seed.is_suppressed(provider, "device_code"):
+                return seed.result
+            _seed_tokens_singleton(seed, auth_store)
+        return seed.result
     auth_store = _load_auth_store()
     if provider == "anthropic":
         _seed_anthropic_singletons(seed)
@@ -2561,12 +2645,6 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         _seed_qwen_singleton(seed)
     elif provider == "minimax-oauth":
         _seed_minimax_singleton(seed)
-    elif provider in _TOKENS_SINGLETON_PROVIDERS:
-        # `hermes auth remove openai-codex` suppresses device_code; without
-        # this gate the removal is undone on the next load_pool().
-        if provider == "openai-codex" and seed.is_suppressed(provider, "device_code"):
-            return seed.result
-        _seed_tokens_singleton(seed, auth_store)
     return seed.result
 
 
@@ -2826,4 +2904,30 @@ def load_pool(provider: str) -> CredentialPool:
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
         )
+    return CredentialPool(provider, entries)
+
+
+def load_pool_snapshot(provider: str) -> CredentialPool:
+    """Return a read-only pool view for status surfaces.
+
+    Unlike ``load_pool()``, this never normalizes, prunes, seeds to disk, or
+    touches cooldown state.  Codex/xAI singleton material is overlaid only in
+    memory so a diagnostic still reports the same credentials as runtime.
+    """
+    provider = (provider or "").strip().lower()
+    raw_entries = read_credential_pool(provider)
+    entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    if provider in _TOKENS_SINGLETON_PROVIDERS:
+        try:
+            from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+            authority = resolve_auth_store_authority(provider)
+            auth_store = _load_auth_store(
+                authority.store_path, fail_closed=authority.shared,
+            )
+            _seed_tokens_singleton(_Seeder(provider, entries), auth_store)
+        except Exception:
+            # Status stays a best-effort snapshot; its resolver reports a
+            # malformed shared authority as an unconfigured provider.
+            pass
     return CredentialPool(provider, entries)

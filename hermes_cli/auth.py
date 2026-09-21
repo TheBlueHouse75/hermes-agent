@@ -594,7 +594,9 @@ def _empty_auth_store() -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+def _load_auth_store(
+    auth_file: Optional[Path] = None, *, fail_closed: bool = False,
+) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return _empty_auth_store()
@@ -621,10 +623,15 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             logger.debug("auth: could not preserve a copy of the corrupt store at %s", corrupt_path,
                          exc_info=True)
         logger.warning(
-            "auth: failed to parse %s (%s), starting with empty store. %s %s",
+            "auth: failed to parse %s (%s), %s. %s %s",
             auth_file, exc,
+            "refusing the shared store" if fail_closed else "starting with empty store",
             "Corrupt file preserved at" if preserved else "A copy could NOT be preserved at",
             corrupt_path)
+        if fail_closed:
+            raise AuthError(
+                "Shared credential store is invalid.", code="invalid_auth_store",
+            ) from exc
         return _empty_auth_store()
 
     if isinstance(raw, dict) and (
@@ -639,6 +646,8 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         providers = {"nous": systems["nous_portal"]} if "nous_portal" in systems else {}
         return {**_empty_auth_store(), "providers": providers,
                 "active_provider": "nous" if providers else None}
+    if fail_closed:
+        raise AuthError("Shared credential store is invalid.", code="invalid_auth_store")
     return _empty_auth_store()
 
 
@@ -677,15 +686,14 @@ def _provider_state_in(store: Dict[str, Any], provider_id: str) -> Optional[Dict
 
 
 def _load_provider_state_with_source(
-    auth_store: Dict[str, Any], provider_id: str,
+    auth_store: Dict[str, Any], provider_id: str, *, source_path: Optional[Path] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[Path]]:
     """Provider state plus the auth.json path it came from (``(None, None)`` when absent).
 
-    Every profile owns its credentials: a named profile never reads the root ``auth.json``
-    (#111724), so the source is always the active store. Refresh paths that rotate single-use
-    OAuth refresh tokens write the rotated chain back to that same path."""
+    Refresh paths that rotate single-use OAuth refresh tokens write the rotated chain back to the
+    explicit resolved authority path, or to the active store for legacy local callers."""
     state = _provider_state_in(auth_store, provider_id)
-    return (state, _auth_file_path()) if state is not None else (None, None)
+    return (state, source_path or _auth_file_path()) if state is not None else (None, None)
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
@@ -695,12 +703,18 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
 @contextmanager
 def _provider_state_transaction(
         provider_id: str, timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
-    """Lock the active auth store and yield ``(store, provider state, source path)``.
+    """Lock the provider's resolved auth store and yield ``(store, state, source path)``.
 
     ``timeout_seconds`` must let waiters outlive a network call made inside the transaction."""
-    with _auth_store_lock(timeout_seconds):
-        auth_store = _load_auth_store()
-        yield (auth_store, *_load_provider_state_with_source(auth_store, provider_id))
+    from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+    with resolved_auth_store_transaction(provider_id, timeout_seconds) as (auth_store, source_path):
+        yield (
+            auth_store,
+            *_load_provider_state_with_source(
+                auth_store, provider_id, source_path=source_path,
+            ),
+        )
 
 
 def _store_provider_state(
@@ -711,17 +725,36 @@ def _store_provider_state(
         auth_store["active_provider"] = provider_id
 
 
+def _set_local_active_provider(provider_id: str) -> None:
+    """Record an explicit named-profile login choice in that profile's own store."""
+    with _auth_store_lock():
+        local_store = _load_auth_store()
+        local_store["active_provider"] = provider_id
+        _save_auth_store(local_store)
+
+
 def _save_provider_state(auth_store: Dict[str, Any], provider_id: str, state: Dict[str, Any]) -> None:
     """Write *state* under ``providers`` and make *provider_id* the active provider."""
     _store_provider_state(auth_store, provider_id, state, set_active=True)
 
 
 def _save_active_provider_state(provider_id: str, state: Dict[str, Any]) -> Path:
-    """Lock, load, write *state* as the active provider, save. Returns the auth store path."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        _save_provider_state(auth_store, provider_id, state)
-        return _save_auth_store(auth_store)
+    """Persist provider state to its authority while keeping active-provider choice local."""
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+    authority = resolve_auth_store_authority(provider_id)
+    with _auth_store_lock(target_path=authority.store_path):
+        auth_store = _load_auth_store(authority.store_path, fail_closed=authority.shared)
+        _store_provider_state(
+            auth_store, provider_id, state, set_active=not authority.shared,
+        )
+        saved_to = _save_auth_store(auth_store, target_path=authority.store_path)
+    if authority.shared:
+        with _auth_store_lock():
+            local_store = _load_auth_store()
+            local_store["active_provider"] = provider_id
+            _save_auth_store(local_store)
+    return saved_to
 
 
 def _save_provider_state_to_source(
@@ -775,15 +808,33 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
 
 
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
-    """Return the persisted credential pool of the ACTIVE store, or one provider slice.
+    """Return one resolved provider slice, or a read-only merged whole-pool view."""
+    from hermes_cli.auth_shared_authority import (
+        _SHAREABLE_PROVIDER_IDS, resolve_auth_store_authority,
+    )
 
-    A named profile reads only its own ``auth.json``: credentials authenticated at the root are
-    not inherited (#111724) — ``hermes -p <name> auth add <provider>`` gives the profile its own."""
-    pool = _load_auth_store().get("credential_pool")
-    pool = pool if isinstance(pool, dict) else {}
     if provider_id is None:
-        return dict(pool)
-    entries = pool.get(provider_id)
+        local_pool = _load_auth_store().get("credential_pool")
+        merged = dict(local_pool) if isinstance(local_pool, dict) else {}
+        for candidate in _SHAREABLE_PROVIDER_IDS:
+            authority = resolve_auth_store_authority(candidate)
+            if not authority.shared:
+                continue
+            shared_pool = _load_auth_store(
+                authority.store_path, fail_closed=True,
+            ).get("credential_pool")
+            entries = shared_pool.get(candidate) if isinstance(shared_pool, dict) else None
+            if isinstance(entries, list):
+                merged[candidate] = list(entries)
+            else:
+                merged.pop(candidate, None)
+        return merged
+
+    authority = resolve_auth_store_authority(provider_id)
+    pool = _load_auth_store(
+        authority.store_path, fail_closed=authority.shared,
+    ).get("credential_pool")
+    entries = pool.get(provider_id) if isinstance(pool, dict) else None
     return list(entries) if isinstance(entries, list) else []
 
 
@@ -860,29 +911,47 @@ def write_credential_pool(
     recency merge, which would otherwise read their cleared ``last_status_at`` (None ->
     epoch 0) as a stale snapshot and copy a still-binding cooldown back."""
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        pool = _store_section(auth_store, "credential_pool")
-        sanitized = [
-            sanitize_borrowed_credential_payload(e, provider_id) if isinstance(e, dict) else e
-            for e in entries]
-        existing_list = pool.get(provider_id)
-        existing_list = existing_list if isinstance(existing_list, list) else []
-        existing_by_id = _entry_ids(existing_list)
-        new_ids = set(_entry_ids(sanitized))
-        status_cleared = {cid for cid in (status_cleared_ids or ()) if cid}
-        merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(
-                e, None if e.get("id") in status_cleared else existing_by_id.get(e.get("id")), provider_id,
-            )
-            if isinstance(e, dict) else e
-            for e in sanitized]
-        for disk_entry in existing_list:
-            disk_id = disk_entry.get("id") if isinstance(disk_entry, dict) else None
-            if disk_id and disk_id not in new_ids and disk_id not in removed:
-                merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
-        pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+    from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+    with resolved_auth_store_transaction(provider_id) as (auth_store, source_path):
+        _replace_credential_pool_entries(
+            auth_store, provider_id, entries,
+            removed_ids=removed, status_cleared_ids=status_cleared_ids,
+        )
+        return _save_auth_store(auth_store, target_path=source_path)
+
+
+def _replace_credential_pool_entries(
+    auth_store: Dict[str, Any], provider_id: str, entries: List[Dict[str, Any]], *,
+    removed_ids: Optional[Iterable[str]] = None,
+    status_cleared_ids: Optional[Iterable[str]] = None,
+) -> None:
+    """Merge one pool slice into an already locked in-memory auth store.
+
+    Rotation paths use this with the matching provider singleton, then make one
+    atomic auth-store replacement for both representations.
+    """
+    removed = {rid for rid in (removed_ids or ()) if rid}
+    pool = _store_section(auth_store, "credential_pool")
+    sanitized = [
+        sanitize_borrowed_credential_payload(e, provider_id) if isinstance(e, dict) else e
+        for e in entries]
+    existing_list = pool.get(provider_id)
+    existing_list = existing_list if isinstance(existing_list, list) else []
+    existing_by_id = _entry_ids(existing_list)
+    new_ids = set(_entry_ids(sanitized))
+    status_cleared = {cid for cid in (status_cleared_ids or ()) if cid}
+    merged: List[Dict[str, Any]] = [
+        _merge_disk_cooldown_state(
+            e, None if e.get("id") in status_cleared else existing_by_id.get(e.get("id")), provider_id,
+        )
+        if isinstance(e, dict) else e
+        for e in sanitized]
+    for disk_entry in existing_list:
+        disk_id = disk_entry.get("id") if isinstance(disk_entry, dict) else None
+        if disk_id and disk_id not in new_ids and disk_id not in removed:
+            merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+    pool[provider_id] = merged
 
 
 def _suppressed_source_list(suppressed: Dict[str, Any], provider_id: str) -> Optional[List[str]]:
@@ -899,29 +968,43 @@ def _suppressed_source_list(suppressed: Dict[str, Any], provider_id: str) -> Opt
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
     """Mark a credential source as suppressed so it won't be re-seeded."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
+
+    with resolved_auth_store_transaction(provider_id) as (auth_store, source_path):
         suppressed = _store_section(auth_store, "suppressed_sources")
         provider_list = _suppressed_source_list(suppressed, provider_id)
         if provider_list is None:
             provider_list = suppressed[provider_id] = []
         if source not in provider_list:
             provider_list.append(source)
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=source_path)
 
 
 def is_source_suppressed(provider_id: str, source: str) -> bool:
     """Check if a credential source has been suppressed by the user."""
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+    authority = resolve_auth_store_authority(provider_id)
     try:
-        return source in _load_auth_store().get("suppressed_sources", {}).get(provider_id, [])
+        store = _load_auth_store(
+            authority.store_path, fail_closed=authority.shared,
+        )
+        return source in store.get("suppressed_sources", {}).get(provider_id, [])
     except Exception:
+        if authority.shared:
+            raise
         return False
 
 
 def unsuppress_credential_source(provider_id: str, source: str) -> bool:
     """Clear a suppression marker so the source will be re-seeded on the next load."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+    authority = resolve_auth_store_authority(provider_id)
+    with _auth_store_lock(target_path=authority.store_path):
+        auth_store = _load_auth_store(
+            authority.store_path, fail_closed=authority.shared,
+        )
         suppressed = auth_store.get("suppressed_sources")
         if not isinstance(suppressed, dict):
             return False
@@ -933,13 +1016,18 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
             suppressed.pop(provider_id, None)
         if not suppressed:
             auth_store.pop("suppressed_sources", None)
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=authority.store_path)
         return True
 
 
 def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
-    """Persisted auth state for a provider in the active store, or None."""
-    return _load_provider_state(_load_auth_store(), provider_id)
+    """Persisted auth state for a provider in its resolved store, or None."""
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+    authority = resolve_auth_store_authority(provider_id)
+    return _load_provider_state(
+        _load_auth_store(authority.store_path, fail_closed=authority.shared), provider_id,
+    )
 
 
 def nous_token_has_billing_scope() -> bool:
@@ -1112,23 +1200,35 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
 def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
     """Clear auth state for a provider (the active one when *provider_id* is None). Used by
     ``hermes logout``. Returns True if something was cleared."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        target = provider_id or auth_store.get("active_provider")
-        if not target:
-            return False
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+    target = provider_id or get_active_provider()
+    if not target:
+        return False
+    authority = resolve_auth_store_authority(target)
+    with _auth_store_lock(target_path=authority.store_path):
+        auth_store = _load_auth_store(
+            authority.store_path, fail_closed=authority.shared,
+        )
         cleared = False
         for section in ("providers", "credential_pool"):
             entries = _store_section(auth_store, section)
             if target in entries:
                 del entries[target]
                 cleared = True
-        if auth_store.get("active_provider") == target:
+        if not authority.shared and auth_store.get("active_provider") == target:
             auth_store["active_provider"] = None
             cleared = True
         if cleared:
-            _save_auth_store(auth_store)
-        return cleared
+            _save_auth_store(auth_store, target_path=authority.store_path)
+    if authority.shared:
+        with _auth_store_lock():
+            local_store = _load_auth_store()
+            if local_store.get("active_provider") == target:
+                local_store["active_provider"] = None
+                _save_auth_store(local_store)
+                cleared = True
+    return cleared
 
 
 def deactivate_provider() -> None:
@@ -1751,8 +1851,11 @@ def _codex_pool_rate_limited_status() -> Optional[Dict[str, Any]]:
     rate_limit = _codex_pool_rate_limit_status()
     if not rate_limit:
         return None
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
     return {
-        "logged_in": True, "auth_store": str(_auth_file_path()),
+        "logged_in": True,
+        "auth_store": str(resolve_auth_store_authority("openai-codex").store_path),
         "last_refresh": rate_limit.get("last_refresh"), "auth_mode": "chatgpt",
         "source": f"pool:{rate_limit.get('label') or 'unknown'}", "rate_limited": True,
         "error_code": CODEX_RATE_LIMITED_CODE,
@@ -1776,7 +1879,7 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
     # unconditionally (auth.json may still carry a legacy ``oauth_pkce`` label).
     return _pool_first_oauth_status(
         "xai-oauth", is_expiring=_xai_access_token_is_expiring, auth_mode="oauth_device_code",
-        resolve=lambda: resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False))
+        resolve=lambda: resolve_xai_oauth_runtime_credentials(read_only=True))
 
 
 def _provider_env_base_url(pconfig: ProviderConfig) -> str:

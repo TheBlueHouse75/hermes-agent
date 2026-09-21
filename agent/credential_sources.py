@@ -157,15 +157,15 @@ def _remove_auth_store_oauth(provider: str, removed) -> RemovalResult:
     Suppression by the dispatcher is still required — otherwise
     ``_seed_from_singletons`` re-seeds from any path that rewrites the block.
     """
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+    from hermes_cli.auth import _save_auth_store
+    from hermes_cli.auth_shared_authority import resolved_auth_store_transaction
 
     result = RemovalResult()
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with resolved_auth_store_transaction(provider) as (auth_store, source_path):
         providers_dict = auth_store.get("providers")
         if isinstance(providers_dict, dict) and provider in providers_dict:
             del providers_dict[provider]
-            _save_auth_store(auth_store)
+            _save_auth_store(auth_store, target_path=source_path)
             result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     return result
 

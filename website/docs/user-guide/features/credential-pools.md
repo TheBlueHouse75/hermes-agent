@@ -88,6 +88,54 @@ The `←` marks the currently selected credential. `id=` is the entry id accepte
 `hermes auth remove <provider> <target>` when a label is ambiguous, and `priority=` is
 the order the pool tries credentials in under the `fill_first` strategy.
 
+## Sharing OAuth credentials between profiles
+
+Profiles keep separate credentials by default. A named profile can explicitly use the
+default profile as the authority for the `openai-codex` and `xai-oauth` providers, but
+only when both profiles opt in. This keeps the shared provider state in one canonical
+default-profile `auth.json` instead of copying a single-use refresh token or linking
+credential files with a symlink.
+
+In the default profile's `~/.hermes/config.yaml`, grant the named consumer access to the
+exact providers it may share:
+
+```yaml
+auth:
+  shared_credentials:
+    consumers:
+      gga: [openai-codex, xai-oauth]
+```
+
+In that consumer's `~/.hermes/profiles/gga/config.yaml`, request the same authority and
+providers:
+
+```yaml
+auth:
+  shared_credentials:
+    authority: default
+    providers: [openai-codex, xai-oauth]
+```
+
+Only the exact provider IDs `openai-codex` and `xai-oauth` are supported, and
+`default` is the only valid authority. A grant in the default profile alone changes
+nothing. Without the consumer-side policy, the named profile continues to use its own
+credentials for every provider.
+
+This is **provider-wide trust**. For each provider listed on both sides, the consumer
+uses the default profile's canonical provider state and credential-pool slice, including
+refreshes, rotation, cooldowns, quarantine, and administrative writes. Other providers,
+the active-provider selection, models, sessions, memories, and all other profile files
+remain local. Per-entry authorization and separate consumer-versus-manager permissions
+are not implemented; that narrower capability is tracked in
+[#108671](https://github.com/NousResearch/hermes-agent/issues/108671).
+
+Shared-provider requests fail closed. A denied or missing bilateral grant, malformed policy,
+unsupported provider ID, or unavailable default authority produces a configuration
+error; Hermes does not fall back to a local, root, or external credential for that
+requested shared provider. Fix the policies so every requested provider appears on both
+sides, or remove `auth.shared_credentials` from the consumer to return that profile to
+normal local credential isolation.
+
 ## Interactive Management
 
 Run `hermes auth` with no subcommand for an interactive wizard:
@@ -241,8 +289,10 @@ imports the Codex CLI's `~/.codex/auth.json` automatically only to *repair a log
 all `dead` (or removed) has nothing left to repair, so a headless gateway or cron profile stays
 without a Codex credential until you run `hermes auth add openai-codex` in *that* home
 (`hermes -p <profile> auth add openai-codex` for a named profile), which offers the Codex CLI import
-interactively. Profiles that should share one login can point at the same `HERMES_HOME` instead of
-each holding a copy of a single-use refresh token.
+interactively. For `openai-codex` or `xai-oauth`, profiles that should share one login must use the
+bilateral [`auth.shared_credentials` policy](#sharing-oauth-credentials-between-profiles) instead of
+sharing a Hermes home or copying a single-use refresh token. Other OAuth providers require a
+separate login in each profile.
 
 **A cooling-down or dead credential is not a blank install.** When a configured profile starts the
 CLI while its only credential is benched or quarantined, startup prints the failure and, for a bench,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -1783,6 +1784,97 @@ def _xai_auth_store(access_token: str, refresh_token: str) -> dict:
             }
         },
     }
+
+
+def test_deferred_codex_refresh_and_pool_persist_complete_with_fresh_pair(tmp_path, monkeypatch):
+    """A deferred rotation and pool flush share pool -> authority lock order."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-cli"))
+    _write_auth_store(tmp_path, {
+        **_codex_auth_store("old-access", "old-refresh"),
+        "credential_pool": {"openai-codex": [{
+            "id": "codex-device-code", "label": "device code", "auth_type": "oauth",
+            "priority": 0, "source": "device_code", "access_token": "old-access",
+            "refresh_token": "old-refresh",
+        }]},
+    })
+
+    from agent.credential_pool import load_pool
+    import hermes_cli.auth as auth
+
+    pool = load_pool("openai-codex")
+    entry = pool.entries()[0]
+    refresh_posted = threading.Event()
+    persist_attempted = threading.Event()
+    persist_holds_pool = threading.Event()
+    release_refresh = threading.Event()
+    write_decision = threading.Event()
+    errors: list[BaseException] = []
+    results = []
+    skip_persist_write = [False]
+
+    def _rotate(access_token, refresh_token):
+        assert (access_token, refresh_token) == ("old-access", "old-refresh")
+        refresh_posted.set()
+        assert release_refresh.wait(timeout=5)
+        return {
+            "access_token": "fresh-access", "refresh_token": "fresh-refresh",
+            "last_refresh": "2026-09-21T00:00:00Z",
+        }
+
+    def _refresh() -> None:
+        try:
+            results.append(pool._refresh_entry(entry, force=True))
+        except BaseException as exc:  # surfaced below from the deterministic worker boundary
+            errors.append(exc)
+
+    def _persist() -> None:
+        try:
+            assert refresh_posted.wait(timeout=1)
+            persist_attempted.set()
+            pool._persist()
+        except BaseException as exc:  # surfaced below from the deterministic worker boundary
+            errors.append(exc)
+
+    original_write = auth.write_credential_pool
+
+    def _write_after_pool_lock(*args, **kwargs):
+        # _persist() holds CredentialPool._lock while calling this boundary.
+        # With the former authority -> pool refresh order, this event fired
+        # while the refresh POST still held the authority lock.
+        persist_holds_pool.set()
+        assert write_decision.wait(timeout=1)
+        if skip_persist_write[0]:
+            return tmp_path / "skipped-auth.json"
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rotate)
+    monkeypatch.setattr("agent.credential_pool.write_credential_pool", _write_after_pool_lock)
+    refresh_thread = threading.Thread(target=_refresh)
+    persist_thread = threading.Thread(target=_persist)
+    refresh_thread.start()
+    assert refresh_posted.wait(timeout=1)
+    persist_thread.start()
+    assert persist_attempted.wait(timeout=1)
+    persisted_while_refresh_held = persist_holds_pool.wait(timeout=1)
+    # Do not leave workers mutually blocked if this assertion ever fails on a
+    # reintroduced authority -> pool inversion.
+    skip_persist_write[0] = persisted_while_refresh_held
+    write_decision.set()
+    release_refresh.set()
+    refresh_thread.join(timeout=1)
+    persist_thread.join(timeout=1)
+
+    assert not refresh_thread.is_alive()
+    assert not persist_thread.is_alive()
+    assert not persisted_while_refresh_held
+    assert errors == []
+    assert results and results[0] is not None
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    tokens = persisted["providers"]["openai-codex"]["tokens"]
+    pool_row = persisted["credential_pool"]["openai-codex"][0]
+    assert tokens == {"access_token": "fresh-access", "refresh_token": "fresh-refresh"}
+    assert (pool_row["access_token"], pool_row["refresh_token"]) == ("fresh-access", "fresh-refresh")
 
 
 

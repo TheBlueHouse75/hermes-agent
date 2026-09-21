@@ -348,12 +348,22 @@ def _unsuppress_provider_sources(provider: str) -> None:
     """Clear ALL suppressions for this provider — re-adding a credential is a strong signal the
     user wants auth re-enabled. Covers env:* (shell-exported vars), gh_cli (copilot), claude_code,
     qwen-cli, device_code (codex), etc. — one consistent re-engagement pattern."""
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+    authority = resolve_auth_store_authority(provider)
     try:
-        suppressed = auth_mod._load_auth_store().get("suppressed_sources", {})
-        for src in list(suppressed.get(provider, []) or []):
+        suppressed = auth_mod._load_auth_store(
+            authority.store_path, fail_closed=authority.shared,
+        ).get("suppressed_sources")
+        sources = (
+            auth_mod._suppressed_source_list(suppressed, provider)
+            if isinstance(suppressed, dict) else None
+        )
+        for src in list(sources or []):
             auth_mod.unsuppress_credential_source(provider, src)
     except Exception:
-        pass
+        if authority.shared:
+            raise
 
 
 def _add_api_key_credential(args, provider: str, pool) -> PooledCredential:

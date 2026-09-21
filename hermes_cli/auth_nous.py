@@ -1287,10 +1287,12 @@ def _pool_first_oauth_status(
     provider as unconfigured while the runtime resolver still serves it. Refreshing stays with the
     runtime resolver reached through *resolve*, whose failures persist nothing.
     """
-    from hermes_cli.auth import _auth_file_path
+    from hermes_cli.auth_shared_authority import resolve_auth_store_authority
+
+    auth_store_path = str(resolve_auth_store_authority(provider_id).store_path)
     try:
-        from agent.credential_pool import load_pool
-        pool = load_pool(provider_id)
+        from agent.credential_pool import load_pool_snapshot
+        pool = load_pool_snapshot(provider_id)
         if pool and pool.has_credentials():
             entry = pool.peek()
             if entry is not None:
@@ -1298,7 +1300,7 @@ def _pool_first_oauth_status(
                     getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", ""))
                 if api_key and not is_expiring(api_key, 0):
                     return {
-                        "logged_in": True, "auth_store": str(_auth_file_path()),
+                        "logged_in": True, "auth_store": auth_store_path,
                         "last_refresh": getattr(entry, "last_refresh", None),
                         "auth_mode": auth_mode,
                         "source": f"pool:{getattr(entry, 'label', 'unknown')}", "api_key": api_key}
@@ -1309,12 +1311,12 @@ def _pool_first_oauth_status(
     try:
         creds = resolve()
         return {
-            "logged_in": True, "auth_store": str(_auth_file_path()),
+            "logged_in": True, "auth_store": auth_store_path,
             "last_refresh": creds.get("last_refresh"),
             "auth_mode": creds.get("auth_mode"), "source": creds.get("source"),
             "api_key": creds.get("api_key")}
     except AuthError as exc:
-        return {"logged_in": False, "auth_store": str(_auth_file_path()), "error": str(exc)}
+        return {"logged_in": False, "auth_store": auth_store_path, "error": str(exc)}
 
 
 def _nous_device_code_login(

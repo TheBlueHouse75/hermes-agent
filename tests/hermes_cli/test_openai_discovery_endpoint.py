@@ -19,6 +19,7 @@ Contracts pinned here:
 
 from __future__ import annotations
 
+import os
 from unittest.mock import patch as mock_patch
 
 import pytest
@@ -82,6 +83,47 @@ class TestDiscoveryBaseUrl:
 
 
 class TestFingerprintTracksEndpoint:
+    def test_authority_auth_mtime_changes_codex_fingerprint(self, tmp_path):
+        local_home = tmp_path / "profile"
+        local_home.mkdir()
+        authority_store = tmp_path / "authority" / "auth.json"
+        authority_store.parent.mkdir()
+        authority_store.write_text("{}", encoding="utf-8")
+
+        with mock_patch(
+            "hermes_constants.get_hermes_home", return_value=local_home
+        ), mock_patch(
+            "hermes_cli.auth_shared_authority.resolve_auth_store_authority"
+        ) as resolve_authority:
+            resolve_authority.return_value.store_path = authority_store
+            before = models_mod._credential_fingerprint("openai-codex")
+            stat = authority_store.stat()
+            os.utime(
+                authority_store,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
+            )
+            after = models_mod._credential_fingerprint("openai-codex")
+
+        assert after != before
+
+    def test_authority_resolution_failure_differs_from_local_auth_fingerprint(self, tmp_path):
+        local_home = tmp_path / "profile"
+        local_home.mkdir()
+
+        with mock_patch(
+            "hermes_constants.get_hermes_home", return_value=local_home
+        ), mock_patch(
+            "hermes_cli.auth_shared_authority.resolve_auth_store_authority"
+        ) as resolve_authority:
+            resolve_authority.return_value.store_path = local_home / "auth.json"
+            local = models_mod._credential_fingerprint("openai-codex")
+            resolve_authority.side_effect = RuntimeError("authority unavailable")
+            failed_once = models_mod._credential_fingerprint("openai-codex")
+            failed_twice = models_mod._credential_fingerprint("openai-codex")
+
+        assert failed_once != local
+        assert failed_twice == failed_once
+
     def test_config_endpoint_change_changes_fingerprint(self, monkeypatch):
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         with mock_patch.object(
