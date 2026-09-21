@@ -750,10 +750,7 @@ def _save_active_provider_state(provider_id: str, state: Dict[str, Any]) -> Path
         )
         saved_to = _save_auth_store(auth_store, target_path=authority.store_path)
     if authority.shared:
-        with _auth_store_lock():
-            local_store = _load_auth_store()
-            local_store["active_provider"] = provider_id
-            _save_auth_store(local_store)
+        _set_local_active_provider(provider_id)
     return saved_to
 
 
